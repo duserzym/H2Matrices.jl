@@ -2,6 +2,8 @@
 
 _A package for assembling and factoring H²-matrices (hierarchical matrices with nested bases)._
 
+So far this package is completely vibed out with AI agents, by feeding the HMatrices.jl library and the H2Lib C library as references. 
+
 ## Installation
 
 ```julia
