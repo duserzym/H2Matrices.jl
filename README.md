@@ -136,4 +136,3 @@ For more information, see the
 - Hackbusch, W., Khoromskij, B., & Sauter, S. A. (2000). On H2-Matrices. In H.-J. Bungartz, R. H. W. Hoppe, & C. Zenger (Eds.), Lectures on Applied Mathematics (pp. 9–29). Springer. https://doi.org/10.1007/978-3-642-59709-1_2
 - HMatrices.jl: https://github.com/IntegralEquations/HMatrices.jl
 - H2Lib: https://github.com/H2Lib/H2Lib
-- 
