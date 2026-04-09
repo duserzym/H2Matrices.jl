@@ -2,7 +2,7 @@
 
 julia_version = "1.11.6"
 manifest_format = "2.0"
-project_hash = "8e6ba5b339fd7acabba496f943a4b79835329346"
+project_hash = "1bb8c097c745ef2224f91701fb4d4d8ba2d02dd9"
 
 [[deps.Artifacts]]
 uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
@@ -25,7 +25,9 @@ version = "1.11.0"
 
 [[deps.HMatrices]]
 deps = ["Distributed", "LinearAlgebra", "Printf", "RecipesBase", "SparseArrays", "StaticArrays", "Statistics"]
-path = "/Users/yimingzhang/Github/HMatrices.jl"
+git-tree-sha1 = "eafa59aa0c5a104b483d6e11573997e8b259fcc0"
+repo-rev = "main"
+repo-url = "https://github.com/IntegralEquations/HMatrices.jl"
 uuid = "8646bddf-ab1c-4fa7-9c51-ba187d647618"
 version = "0.2.13"
 
