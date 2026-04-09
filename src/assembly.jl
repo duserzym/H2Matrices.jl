@@ -64,6 +64,7 @@ function assemble_h2matrix(
     kf = _extract_kernel_info(K)
     _fill_h2_data!(h2, Kp, kf, order)
 
+    _print_compression_summary(h2)
     return h2
 end
 

@@ -10,6 +10,7 @@ using HMatrices: ClusterTree, HyperRectangle, AbstractKernelMatrix, KernelMatrix
     diameter, distance, center, low_corner, high_corner,
     StrongAdmissibilityStd, GeometricSplitter,
     getblock!
+using RecipesBase
 
 include("clusterbasis.jl")
 include("uniformblock.jl")
@@ -18,6 +19,7 @@ include("basis_construction.jl")
 include("matvec.jl")
 include("assembly.jl")
 include("compression.jl")
+include("plotting.jl")
 
 export ClusterBasis,
     H2Matrix,
@@ -25,6 +27,8 @@ export ClusterBasis,
     assemble_h2matrix,
     assemble_h2matrix_adaptive,
     compress_hmatrix_to_h2,
+    compression_ratio,
+    depth,
     recompress!,
     forward_transform!,
     backward_transform!,

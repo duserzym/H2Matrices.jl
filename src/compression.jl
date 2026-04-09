@@ -44,7 +44,8 @@ An `H2Matrix` approximating the same kernel.
 """
 function compress_hmatrix_to_h2(hmat::HMatrix;
                                 rtol::Float64=1e-8,
-                                maxrank::Int=50)
+                                maxrank::Int=50,
+                                _print::Bool=true)
     rt = HMatrices.rowtree(hmat)
     ct = HMatrices.coltree(hmat)
 
@@ -75,6 +76,7 @@ function compress_hmatrix_to_h2(hmat::HMatrix;
     _fill_h2_from_hmat!(h2, hmat, row_map, col_map)
 
     h2.global_index = true
+    _print && _print_compression_summary(h2)
     return h2
 end
 
@@ -816,8 +818,9 @@ function assemble_h2matrix_adaptive(
                                        kwargs...)
 
     # Step 2: Convert to H²
-    h2 = compress_hmatrix_to_h2(hmat; rtol, maxrank)
+    h2 = compress_hmatrix_to_h2(hmat; rtol, maxrank, _print=false)
 
+    _print_compression_summary(h2)
     return h2
 end
 

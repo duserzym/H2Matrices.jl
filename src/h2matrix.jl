@@ -58,6 +58,49 @@ end
 
 Base.eltype(::H2Matrix) = Float64
 
+function Base.getindex(h::H2Matrix, i::Int, j::Int)
+    @boundscheck begin
+        m, n = size(h)
+        (1 <= i <= m && 1 <= j <= n) || throw(BoundsError(h, (i, j)))
+    end
+    # Convert to local cluster indices
+    rc = h.row_basis.cluster
+    cc = h.col_basis.cluster
+    gi = index_range(rc).start - 1 + i
+    gj = index_range(cc).start - 1 + j
+    return _getindex_local(h, gi, gj)
+end
+
+function _getindex_local(h::H2Matrix, gi::Int, gj::Int)
+    if isleaf(h)
+        rc = h.row_basis.cluster
+        cc = h.col_basis.cluster
+        ir = index_range(rc)
+        jr = index_range(cc)
+        li = gi - ir.start + 1
+        lj = gj - jr.start + 1
+        if h.uniform !== nothing
+            # A = V * S * W'
+            V = _full_basis(h.row_basis)
+            W = _full_basis(h.col_basis)
+            return dot(view(V, li, :), h.uniform.S * view(W, lj, :))
+        elseif h.dense !== nothing
+            return h.dense[li, lj]
+        else
+            return 0.0
+        end
+    else
+        for child in h.children
+            crc = child.row_basis.cluster
+            ccc = child.col_basis.cluster
+            if gi in index_range(crc) && gj in index_range(ccc)
+                return _getindex_local(child, gi, gj)
+            end
+        end
+        return 0.0
+    end
+end
+
 """
     leaves(h::H2Matrix)
 
@@ -222,13 +265,74 @@ function _fill_dense!(M, h::H2Matrix, row_offset, col_offset)
     return M
 end
 
+"""
+    depth(h::H2Matrix)
+
+Return the depth of the H²-matrix tree.
+"""
+function depth(h::H2Matrix)
+    if isleaf(h)
+        return 0
+    else
+        return 1 + maximum(depth(c) for c in h.children)
+    end
+end
+
 function Base.show(io::IO, h::H2Matrix{N,T}) where {N,T}
     m, n = size(h)
-    print(io, "H2Matrix{$N,$T}: $m × $n")
+    all_nodes = nodes(h)
     lvs = leaves(h)
-    n_adm = count(isadmissible, lvs)
-    n_dense = length(lvs) - n_adm
-    print(io, "\n  leaves: $(length(lvs)) ($n_adm admissible + $n_dense dense)")
-    print(io, "\n  compression ratio: $(round(compression_ratio(h); digits=2))")
+    adm_leaves = filter(l -> l.uniform !== nothing, lvs)
+    dense_leaves = filter(l -> l.dense !== nothing, lvs)
+    n_adm = length(adm_leaves)
+    n_dense = length(dense_leaves)
+
+    println(io, "H2Matrix of $T with range 1:$m × 1:$n")
+    println(io, "         number of nodes in tree: $(length(all_nodes))")
+    println(io, "         number of leaves: $(length(lvs)) ($n_adm admissible + $n_dense dense)")
+
+    if n_adm > 0
+        ranks = [size(l.uniform.S, 1) for l in adm_leaves]
+        println(io, "         min rank of admissible blocks: $(minimum(ranks))")
+        println(io, "         max rank of admissible blocks: $(maximum(ranks))")
+    end
+
+    if n_dense > 0
+        lens = [length(l.dense) for l in dense_leaves]
+        println(io, "         min length of dense blocks: $(minimum(lens))")
+        println(io, "         max length of dense blocks: $(maximum(lens))")
+    end
+
+    if !isempty(lvs)
+        elems = Int[]
+        for l in lvs
+            if l.uniform !== nothing
+                push!(elems, prod(size(l.uniform)))
+            elseif l.dense !== nothing
+                push!(elems, length(l.dense))
+            end
+        end
+        if !isempty(elems)
+            println(io, "         min number of elements per leaf: $(minimum(elems))")
+            println(io, "         max number of elements per leaf: $(maximum(elems))")
+        end
+    end
+
+    println(io, "         depth of tree: $(depth(h))")
+    print(io,   "         compression ratio: $(round(compression_ratio(h); digits=6))")
 end
 Base.show(io::IO, ::MIME"text/plain", h::H2Matrix) = show(io, h)
+
+function _print_compression_summary(h::H2Matrix)
+    m, n = size(h)
+    uncompressed = m * n * sizeof(Float64)
+    compressed = _storage_bytes(h)
+    ratio = compression_ratio(h)
+    function _human(bytes)
+        bytes < 1024 && return "$(bytes) B"
+        bytes < 1024^2 && return "$(round(bytes/1024; digits=1)) KB"
+        bytes < 1024^3 && return "$(round(bytes/1024^2; digits=1)) MB"
+        return "$(round(bytes/1024^3; digits=2)) GB"
+    end
+    @info "H²-matrix assembled" size="$m × $n" uncompressed=_human(uncompressed) compressed=_human(compressed) ratio=round(ratio; digits=2)
+end
