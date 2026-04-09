@@ -2,8 +2,6 @@
 
 *Fast hierarchical matrix algebra with nested bases in Julia.*
 
-[![Documentation](https://github.com/duserzym/H2Matrices.jl/actions/workflows/docs.yml/badge.svg)](https://github.com/duserzym/H2Matrices.jl/actions/workflows/docs.yml)
-
 ## What is an H²-matrix?
 
 Many problems in physics and engineering lead to large dense matrices that arise
