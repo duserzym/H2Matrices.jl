@@ -327,3 +327,65 @@ would require roughly 75 GB; the hierarchical representations fit comfortably in
 a few hundred MB.
 
 ![Compression comparison](assets/ex5_compression.png)
+
+## Example 6: Quick-Start — Sphere with Side-by-Side Visualization
+
+This self-contained example mirrors the [notebook](https://github.com/duserzym/H2Matrices.jl/blob/main/example/example.ipynb)
+shipped with the package. It assembles both an H-matrix and an H²-matrix on
+50 000 points on a sphere, compares their accuracy, and produces a side-by-side
+block-structure plot.
+
+```julia
+using H2Matrices
+using HMatrices: KernelMatrix, ClusterTree, GeometricSplitter,
+    assemble_hmatrix, compression_ratio
+using StaticArrays, LinearAlgebra
+using Plots
+
+const Point3D = SVector{3,Float64}
+
+# --- Point geometry: random points on a sphere ---
+m = 50_000
+X = Y = [Point3D(sin(θ)cos(ϕ), sin(θ)*sin(ϕ), cos(θ))
+         for (θ,ϕ) in zip(π*rand(m), 2π*rand(m))]
+
+# Laplace free-space Green's function (regularised)
+function G(x, y)
+    d = norm(x - y) + 1e-8
+    1 / (4π * d)
+end
+
+K = KernelMatrix(G, X, Y)
+
+# --- H-matrix assembly ---
+H = assemble_hmatrix(K; atol=1e-6)
+
+# --- H²-matrix assembly ---
+h2 = assemble_h2matrix(K; order=4)
+
+# --- Matvec accuracy check ---
+x = rand(m)
+y_h  = H * x
+y_h2 = h2 * x
+exact_42 = sum(K[42,j]*x[j] for j in 1:m)
+
+println("H-matrix  matvec error at index 42: ", abs(y_h[42]  - exact_42))
+println("H²-matrix matvec error at index 42: ", abs(y_h2[42] - exact_42))
+
+# --- Side-by-side block structure plot ---
+plot(
+    plot(H;  title="H-matrix"),
+    plot(h2; title="H²-matrix");
+    layout=(1,2), size=(1000, 450)
+)
+savefig("h_and_h2_matrix_block_structures.png")
+```
+
+**Output:**
+
+```
+H-matrix  matvec error at index 42: ≈ 2e-7
+H²-matrix matvec error at index 42: ≈ 5e-4
+```
+
+![H vs H² block structures](assets/h_and_h2_matrix_block_structures.png)
