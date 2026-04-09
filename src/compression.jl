@@ -74,6 +74,7 @@ function compress_hmatrix_to_h2(hmat::HMatrix;
     # Fill coupling matrices and dense blocks from H-matrix data
     _fill_h2_from_hmat!(h2, hmat, row_map, col_map)
 
+    h2.global_index = true
     return h2
 end
 

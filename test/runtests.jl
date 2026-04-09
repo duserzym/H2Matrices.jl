@@ -103,11 +103,9 @@ using Random
 
         # Test matvec accuracy against dense
         K_dense = Matrix{Float64}(undef, n, n)
-        rp = loc2glob(Xclt)
-        cp = loc2glob(Yclt)
         for j in 1:n
             for i in 1:n
-                K_dense[i, j] = K[rp[i], cp[j]]
+                K_dense[i, j] = K[i, j]
             end
         end
 
@@ -142,11 +140,9 @@ using Random
 
         # Dense reference
         K_dense = Matrix{Float64}(undef, n, n)
-        rp = loc2glob(Xclt)
-        cp = loc2glob(Yclt)
         for j in 1:n
             for i in 1:n
-                K_dense[i, j] = K[rp[i], cp[j]]
+                K_dense[i, j] = K[i, j]
             end
         end
 
@@ -239,12 +235,10 @@ using Random
 
         @test size(h2) == (n, n)
 
-        # Dense reference (local ordering)
+        # Dense reference (global ordering)
         K_dense = Matrix{Float64}(undef, n, n)
-        rp = loc2glob(Xclt)
-        cp = loc2glob(Yclt)
         for j in 1:n, i in 1:n
-            K_dense[i, j] = K[rp[i], cp[j]]
+            K_dense[i, j] = K[i, j]
         end
 
         x = randn(n)
@@ -279,10 +273,8 @@ using Random
         @test size(h2) == (n, n)
 
         K_dense = Matrix{Float64}(undef, n, n)
-        rp = loc2glob(Xclt)
-        cp = loc2glob(Yclt)
         for j in 1:n, i in 1:n
-            K_dense[i, j] = K[rp[i], cp[j]]
+            K_dense[i, j] = K[i, j]
         end
 
         x = randn(n)
@@ -315,10 +307,8 @@ using Random
         @test size(h2) == (n, n)
 
         K_dense = Matrix{Float64}(undef, n, n)
-        rp = loc2glob(Xclt)
-        cp = loc2glob(Yclt)
         for j in 1:n, i in 1:n
-            K_dense[i, j] = K[rp[i], cp[j]]
+            K_dense[i, j] = K[i, j]
         end
 
         x = randn(n)
@@ -345,10 +335,8 @@ using Random
         h2 = assemble_h2matrix(K, Xclt, Yclt; order=5, global_index=true)
 
         K_dense = Matrix{Float64}(undef, n, n)
-        rp = loc2glob(Xclt)
-        cp = loc2glob(Yclt)
         for j in 1:n, i in 1:n
-            K_dense[i, j] = K[rp[i], cp[j]]
+            K_dense[i, j] = K[i, j]
         end
 
         x = randn(n)

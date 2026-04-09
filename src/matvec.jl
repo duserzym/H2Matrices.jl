@@ -227,15 +227,17 @@ function h2matvec!(
     y::AbstractVector,
     h2::H2Matrix{N,T},
     x::AbstractVector;
-    global_index::Bool=false
+    global_index::Bool=h2.global_index
 ) where {N,T}
     rc = h2.row_basis.cluster
     cc = h2.col_basis.cluster
 
     if global_index
-        # Permute to local ordering
+        # Permute input to local ordering (creates a copy)
         x_local = x[loc2glob(cc)]
-        y_local = y[loc2glob(rc)]
+        # Permute y in-place so that computations write to the correct locations
+        permute!(y, loc2glob(rc))
+        y_local = y
     else
         x_local = x
         y_local = y
@@ -272,7 +274,7 @@ function LinearAlgebra.mul!(
     x::AbstractVector,
     α::Number=1,
     β::Number=0;
-    global_index::Bool=false
+    global_index::Bool=h2.global_index
 )
     # Scale y by β
     if iszero(β)
@@ -297,7 +299,7 @@ function LinearAlgebra.mul!(
     return y
 end
 
-Base.:*(h2::H2Matrix, x::AbstractVector) = mul!(zeros(size(h2, 1)), h2, x)
+Base.:*(h2::H2Matrix, x::AbstractVector) = mul!(zeros(size(h2, 1)), h2, x; global_index=h2.global_index)
 
 # ──────────────────────────────────────────────────────────────────
 # Helper: find root cluster

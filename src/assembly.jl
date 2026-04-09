@@ -57,6 +57,7 @@ function assemble_h2matrix(
 
     # Step 3: Build block structure
     h2 = build_h2_block_structure(row_basis, col_basis, adm)
+    h2.global_index = global_index
 
     # Step 4: Fill the data (coupling matrices + dense blocks)
     # Extract kernel function and element lists for direct evaluation

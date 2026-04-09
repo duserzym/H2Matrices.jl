@@ -18,6 +18,7 @@ The matrix has the same block structure as an H-matrix, but:
 - `dense::Union{Matrix{Float64}, Nothing}` : dense block for inadmissible leaves
 - `children::Matrix{H2Matrix{N,T}}` : child blocks (rsons × csons)
 - `admissible::Bool` : whether this block is admissible
+- `global_index::Bool` : if true, `*` and `mul!` permute input/output to global ordering
 """
 mutable struct H2Matrix{N,T} <: AbstractMatrix{Float64}
     row_basis::ClusterBasis{N,T}
@@ -26,8 +27,9 @@ mutable struct H2Matrix{N,T} <: AbstractMatrix{Float64}
     dense::Union{Matrix{Float64}, Nothing}
     children::Matrix{H2Matrix{N,T}}
     admissible::Bool
+    global_index::Bool
 
-    function H2Matrix(rb::ClusterBasis{N,T}, cb::ClusterBasis{N,T}) where {N,T}
+    function H2Matrix(rb::ClusterBasis{N,T}, cb::ClusterBasis{N,T}; global_index::Bool=false) where {N,T}
         h2 = new{N,T}()
         h2.row_basis = rb
         h2.col_basis = cb
@@ -35,6 +37,7 @@ mutable struct H2Matrix{N,T} <: AbstractMatrix{Float64}
         h2.dense = nothing
         h2.children = Matrix{H2Matrix{N,T}}(undef, 0, 0)
         h2.admissible = false
+        h2.global_index = global_index
         return h2
     end
 end
@@ -171,11 +174,11 @@ function _storage_bytes(h::H2Matrix)
 end
 
 """
-    Matrix(h::H2Matrix; global_index=false)
+    Matrix(h::H2Matrix; global_index=h.global_index)
 
 Convert an H²-matrix to a dense matrix.
 """
-function Base.Matrix(h::H2Matrix; global_index=false)
+function Base.Matrix(h::H2Matrix; global_index=h.global_index)
     m, n = size(h)
     M = zeros(Float64, m, n)
     rc = h.row_basis.cluster
