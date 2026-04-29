@@ -2,7 +2,7 @@
 
 _A package for assembling and factoring H²-matrices (hierarchical matrices with nested bases)._
 
-So far this package is completely vibed out with AI agents, by feeding the HMatrices.jl library and the H2Lib C library as references. 
+So far this package is completely vibed out with AI agents, by feeding the HMatrices.jl library and the H2Lib C library as references. Please feel free to test and use with caution.
 
 ## Installation
 
@@ -29,8 +29,7 @@ is, `K[i,j] = G(X[i], Y[j])`.  This object can be constructed as follows:
 
 ```julia
 using H2Matrices
-using HMatrices: KernelMatrix, ClusterTree, GeometricSplitter,
-    assemble_hmatrix, compression_ratio
+using HMatrices: KernelMatrix, ClusterTree, GeometricSplitter, assemble_hmatrix
 using StaticArrays, LinearAlgebra
 using Plots
 
@@ -76,19 +75,21 @@ y_h  = H * x
 y_h2 = h2 * x
 ```
 
-To check that these are indeed good approximations, compare against the exact
-value at a given entry:
+For small problems you can compare against a dense reference. For large problems,
+sample a few entries or matvecs:
 
 ```julia
-exact_42 = sum(K[42,j]*x[j] for j in 1:m)
+sample = 42
+exact_sample = sum(K[sample,j] * x[j] for j in 1:m)
 
-println("H-matrix  absolute error at index 42: ", abs(y_h[42]  - exact_42))
-println("H²-matrix absolute error at index 42: ", abs(y_h2[42] - exact_42))
+println("H-matrix  sampled entry error: ", abs(y_h[sample]  - exact_sample))
+println("H²-matrix sampled entry error: ", abs(y_h2[sample] - exact_sample))
+println("H² summary: ", H2Matrices.compression_summary(h2))
 ```
 
 ```
-H-matrix  absolute error at index 42: ≈ 2e-7
-H²-matrix absolute error at index 42: ≈ 5e-4
+H-matrix  sampled entry error: ≈ 2e-7
+H²-matrix sampled entry error: ≈ 5e-4
 ```
 
 > **Tip**: You can visualize the underlying block structure using Plots.jl
@@ -106,8 +107,8 @@ H²-matrix absolute error at index 42: ≈ 5e-4
 >
 > ![H vs H² block structures](docs/src/assets/h_and_h2_matrix_block_structures.png)
 >
-> Admissible (low-rank) blocks are shown in blue, dense (near-field) blocks in
-> gold.  Darker shading indicates denser blocks.
+> Admissible blocks are colored by rank: darker blue means lower rank, brighter
+> gold means higher rank. Dense near-field blocks are shown in orange.
 
 ## Key Features
 
@@ -119,6 +120,10 @@ H²-matrix absolute error at index 42: ≈ 5e-4
   coupling → backward transform + near-field).
 - **Recompression** — reduce basis ranks of an existing H²-matrix while
   controlling approximation error.
+- **Diagnostics** — summarize storage, block counts, ranks, and sampled
+  approximation errors.
+- **Solver wrappers** — CG and restarted GMRES operate directly on compressed
+  H² matrices through `mul!`.
 - **Built on [HMatrices.jl](https://github.com/WaveProp/HMatrices.jl)** —
   leverages its cluster trees, admissibility conditions, and ACA.
 - **Appropriate application domains** — ideal for large dense matrices arising from non-local
@@ -130,6 +135,8 @@ H²-matrix absolute error at index 42: ≈ 5e-4
 For more information, see the
 [documentation](docs/src/index.md) and the
 [examples](docs/src/examples.md).
+
+The current development plan is tracked in [ROADMAP.md](ROADMAP.md).
 
 ## References
 

@@ -155,6 +155,7 @@ y_a = h2_auto * x_a
 println("Matvec computed with $(length(y_a)) entries")
 cr_auto = H2Matrices.compression_ratio(h2_auto)
 println("Compression ratio: $(round(cr_auto; sigdigits=3))")
+println("Block stats: ", H2Matrices.block_stats(h2_auto))
 
 # Dense reference for error
 K_a_dense = Matrix{Float64}(undef, N3, N3)
@@ -267,11 +268,12 @@ println("H²-matrix compression ratio: $(round(cr_h2_5; sigdigits=3))")
 y_h2_5 = h2_5 * x5
 
 # Spot-check error at entry 42
-exact_42 = sum(K5[42, j] * x5[j] for j in 1:m)
-err_h_42 = abs(y_h5[42] - exact_42)
-err_h2_42 = abs(y_h2_5[42] - exact_42)
-println("H  matvec y[42] error: $(round(err_h_42; sigdigits=3))")
-println("H² matvec y[42] error: $(round(err_h2_42; sigdigits=3))")
+sample = 42
+exact_sample = sum(K5[sample, j] * x5[j] for j in 1:m)
+err_h_sample = abs(y_h5[sample] - exact_sample)
+err_h2_sample = abs(y_h2_5[sample] - exact_sample)
+println("H  sampled entry error: $(round(err_h_sample; sigdigits=3))")
+println("H² sampled entry error: $(round(err_h2_sample; sigdigits=3))")
 
 # --- Ex5 Plot: 3D scatter of sphere points + compression bar chart ---
 p5a = scatter([p[1] for p in X5], [p[2] for p in X5], [p[3] for p in X5],

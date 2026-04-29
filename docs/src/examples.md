@@ -1,5 +1,17 @@
 # Examples
 
+These examples are meant to answer three practical questions:
+
+1. How do I assemble an H² approximation of a kernel matrix?
+2. How do I measure whether the approximation is accurate enough?
+3. How do I use the compressed operator in a solver without materializing the
+   dense matrix?
+
+For small examples we form a dense reference matrix so the error numbers are
+easy to audit. For large examples, prefer sampled entry checks or sampled
+matvec checks with [`relative_matvec_error`](@ref) and
+[`sampled_frobenius_error`](@ref).
+
 ## Visualizing Matrix Compression
 
 To build intuition, let's start with a visual overview of how H-matrices and
@@ -21,15 +33,24 @@ Near-field (close-together) blocks are stored as dense matrices (orange), while
 far-field blocks are compressed:
 
 - **H-matrix**: each admissible block stores its own independent low-rank
-  factors (blue, shade indicates rank).
-- **H²-matrix**: admissible blocks share nested cluster bases (green), storing
-  only small coupling matrices.
+  factors.
+- **H²-matrix**: admissible blocks share nested cluster bases, storing only
+  small coupling matrices.
+
+In the block plots, low-rank admissible blocks are dark blue and higher-rank
+admissible blocks move toward bright gold. Dense near-field blocks are orange.
 
 ![H vs H² comparison](assets/h_vs_h2_comparison.png)
 
 The block structure is identical — the difference is in how the low-rank data is
 stored.  H²-matrices achieve ``O(N)`` storage by sharing bases across blocks at
 the same tree level.
+
+!!! note
+    Compression ratios reported by H2Matrices.jl include row and column cluster
+    bases, not only leaf dense blocks and coupling matrices. Small examples may
+    have ratios below one because setup overhead dominates; the asymptotic
+    advantage appears as the geometry grows.
 
 ### Approximation Error
 
@@ -105,6 +126,7 @@ println("  compression ratio = ", H2Matrices.compression_ratio(h2_cheb))
 h2_ada = assemble_h2matrix_adaptive(K, Xclt, Yclt; rtol=1e-6, maxrank=50)
 println("Adaptive (rtol=1e-6): error = ", norm(h2_ada * x - y_ref) / norm(y_ref))
 println("  compression ratio = ", H2Matrices.compression_ratio(h2_ada))
+println("  rank summary = ", H2Matrices.rank_stats(h2_ada))
 
 # --- Recompression ---
 h2_recomp = assemble_h2matrix(K, Xclt, Yclt; order=5, global_index=true)
@@ -125,16 +147,18 @@ Adaptive (rtol=1e-6): error = 1.54e-6
 Recompressed: rank 775 → 118, error = 0.000402
 ```
 
-The adaptive method achieves 6 orders of magnitude better accuracy.
-Recompression reduces total basis rank by 6.6× while preserving sub-0.1% error.
+The adaptive method achieves much better accuracy on this separated geometry.
+Recompression reduces total basis rank while preserving sub-0.1% error. Treat
+the exact printed values as representative rather than contractual: small
+changes in BLAS, HMatrices.jl, or storage accounting can move them.
 
 ![Compression ratios](assets/ex1_compression.png)
 ![Matvec errors](assets/ex1_errors.png)
 
 ## Example 2: 3D Laplace Kernel
 
-The same workflow extends to three dimensions — common in geophysics (gravity
-modeling) and micromagnetics (demagnetizing field):
+The same workflow extends to three dimensions, as needed for gravity,
+electrostatics, and other potential-field kernels:
 
 ```julia
 Random.seed!(123)
@@ -199,7 +223,7 @@ println("Size: ", size(h2))
 x = randn(N)
 y = h2 * x
 println("Matvec computed with $(length(y)) entries")
-println("Compression ratio: ", H2Matrices.compression_ratio(h2))
+println("Summary: ", H2Matrices.compression_summary(h2))
 ```
 
 **Output:**
@@ -207,7 +231,7 @@ println("Compression ratio: ", H2Matrices.compression_ratio(h2))
 ```
 Size: (200, 200)
 Matvec computed with 200 entries
-Compression ratio: 150.0
+Summary: (size = (200, 200), ..., compression_ratio = ...)
 ```
 
 The source and target point sets for this example:
@@ -248,14 +272,14 @@ h2 = compress_hmatrix_to_h2(hmat; rtol=1e-6, maxrank=50)
 recompress!(h2; rtol=1e-4, maxrank=30)
 
 println("H²-matrix size: ", size(h2))
-println("Compression ratio: ", H2Matrices.compression_ratio(h2))
+println("Summary: ", H2Matrices.compression_summary(h2))
 ```
 
 **Output:**
 
 ```
 H²-matrix size: (300, 300)
-Compression ratio: 2500.0
+Summary: (size = (300, 300), ..., compression_ratio = ...)
 ```
 
 Recompression reduces the total basis rank from 507 to 120 — a 4.2× reduction —
@@ -302,14 +326,15 @@ println("H-matrix compression ratio: ", HMatrices.compression_ratio(H))
 # Quick matvec check
 x = rand(m)
 y_h = H * x
-println("H  matvec y[42] error: ", abs(y_h[42] - sum(K[42,j]*x[j] for j in 1:m)))
+sample = 42
+println("H  sampled entry error: ", abs(y_h[sample] - sum(K[sample,j]*x[j] for j in 1:m)))
 
 # --- H²-matrix assembly (one liner) ---
 h2 = assemble_h2matrix_adaptive(K; rtol=1e-6, maxrank=80, nmax=32)
 println("H²-matrix compression ratio: ", H2Matrices.compression_ratio(h2))
 
 y_h2 = h2 * x
-println("H² matvec y[42] error: ", abs(y_h2[42] - sum(K[42,j]*x[j] for j in 1:m)))
+println("H² sampled entry error: ", abs(y_h2[sample] - sum(K[sample,j]*x[j] for j in 1:m)))
 ```
 
 **Output** (with ``m = 10\,000`` for this documentation build):
@@ -317,75 +342,65 @@ println("H² matvec y[42] error: ", abs(y_h2[42] - sum(K[42,j]*x[j] for j in 1:m
 ```
 H-matrix compression ratio: 4.42
 H²-matrix compression ratio: 9.74
-H  matvec y[42] error: 1.58e-7
-H² matvec y[42] error: 5.24e-4
+H  sampled entry error: 1.58e-7
+H² sampled entry error: 5.24e-4
 ```
 
-The H²-matrix achieves better compression than the H-matrix thanks to shared
-nested bases.  On the full ``100\,000 \times 100\,000`` problem the dense matrix
-would require roughly 75 GB; the hierarchical representations fit comfortably in
-a few hundred MB.
+The H²-matrix can achieve better compression than the H-matrix thanks to shared
+nested bases. On small documentation builds, basis storage and setup overhead can
+dominate; the advantage becomes clearer as the geometry grows. On the full
+``100\,000 \times 100\,000`` problem the dense matrix would require roughly
+75 GB.
 
 ![Compression comparison](assets/ex5_compression.png)
 
-## Example 6: Quick-Start — Sphere with Side-by-Side Visualization
+## Example 6: Solver Workflow
 
-This self-contained example mirrors the [notebook](https://github.com/duserzym/H2Matrices.jl/blob/main/example/example.ipynb)
-shipped with the package. It assembles both an H-matrix and an H²-matrix on
-50 000 points on a sphere, compares their accuracy, and produces a side-by-side
-block-structure plot.
+H² matrices are most useful when they remain compressed all the way into an
+iterative solver. [`solve_cg`](@ref) and [`solve_gmres`](@ref) work with any
+`AbstractMatrix`, but they are designed so an `H2Matrix` can be used directly
+through its `mul!` implementation.
 
 ```julia
 using H2Matrices
-using HMatrices: KernelMatrix, ClusterTree, GeometricSplitter,
-    assemble_hmatrix, compression_ratio
-using StaticArrays, LinearAlgebra
-using Plots
+using HMatrices: ClusterTree, GeometricSplitter
+using LinearAlgebra, Random, StaticArrays
 
-const Point3D = SVector{3,Float64}
+Random.seed!(7)
 
-# --- Point geometry: random points on a sphere ---
-m = 50_000
-X = Y = [Point3D(sin(θ)cos(ϕ), sin(θ)*sin(ϕ), cos(θ))
-         for (θ,ϕ) in zip(π*rand(m), 2π*rand(m))]
-
-# Laplace free-space Green's function (regularised)
-function G(x, y)
-    d = norm(x - y) + 1e-8
-    1 / (4π * d)
+# Small SPD dense reference, used here only to demonstrate the solver path.
+n = 300
+pts = [SVector{2,Float64}(rand(), rand()) for _ in 1:n]
+A = Matrix{Float64}(I, n, n)
+for j in 1:n, i in 1:n
+    A[i, j] += 0.05 * exp(-sum(abs2, pts[i] - pts[j]))
 end
+A = Matrix(Symmetric(A))
 
-K = KernelMatrix(G, X, Y)
+tree = ClusterTree(deepcopy(pts), GeometricSplitter(; nmax=32))
+h2 = compress_matrix_to_h2(A, tree, tree; rtol=1e-8, maxrank=40)
 
-# --- H-matrix assembly ---
-H = assemble_hmatrix(K; atol=1e-6)
+b = randn(n)
 
-# --- H²-matrix assembly ---
-h2 = assemble_h2matrix(K; order=4)
+# CG for SPD-like operators
+cg = solve_cg(h2, b; tol=1e-6, maxiter=200)
+println("CG converged: ", cg.converged, " in ", cg.iterations, " iterations")
+println("relative residual: ", norm(h2 * cg.x - b) / norm(b))
 
-# --- Matvec accuracy check ---
-x = rand(m)
-y_h  = H * x
-y_h2 = h2 * x
-exact_42 = sum(K[42,j]*x[j] for j in 1:m)
-
-println("H-matrix  matvec error at index 42: ", abs(y_h[42]  - exact_42))
-println("H²-matrix matvec error at index 42: ", abs(y_h2[42] - exact_42))
-
-# --- Side-by-side block structure plot ---
-plot(
-    plot(H;  title="H-matrix"),
-    plot(h2; title="H²-matrix");
-    layout=(1,2), size=(1000, 450)
-)
-savefig("h_and_h2_matrix_block_structures.png")
+# GMRES for general nonsymmetric operators
+gm = solve_gmres(h2, b; tol=1e-6, restart=30, maxiter=200)
+println("GMRES converged: ", gm.converged, " in ", gm.iterations, " iterations")
+println("relative residual: ", norm(h2 * gm.x - b) / norm(b))
 ```
 
 **Output:**
 
 ```
-H-matrix  matvec error at index 42: ≈ 2e-7
-H²-matrix matvec error at index 42: ≈ 5e-4
+CG converged: true in ... iterations
+relative residual: ...
+GMRES converged: true in ... iterations
+relative residual: ...
 ```
 
-![H vs H² block structures](assets/h_and_h2_matrix_block_structures.png)
+For large problems, the same pattern applies: assemble or convert the compressed
+operator, keep it compressed, and pass it directly to the solver.

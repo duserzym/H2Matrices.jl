@@ -22,6 +22,16 @@ using Plots: cgrad, RGB
 const ASSETS = joinpath(@__DIR__, "src", "assets")
 mkpath(ASSETS)
 
+const DENSE_COLOR = RGB(0.85, 0.32, 0.15)
+const LOW_RANK_COLOR = RGB(0.04, 0.17, 0.42)
+const HIGH_RANK_COLOR = RGB(1.00, 0.77, 0.16)
+
+function rank_cgrad(maxrank)
+    maxrank = max(maxrank, 1)
+    maxrank == 1 && return cgrad([DENSE_COLOR, LOW_RANK_COLOR], [-1, 1])
+    cgrad([DENSE_COLOR, LOW_RANK_COLOR, HIGH_RANK_COLOR], [-1, 1, maxrank])
+end
+
 # ──────────────────────────────────────────────────────────────────
 # Setup: 2D Laplace problem (coincident geometry for block structure)
 # ──────────────────────────────────────────────────────────────────
@@ -107,27 +117,8 @@ function block_boundaries_hmat!(shapes, hmat; admissible_only=false)
     end
 end
 
-# Build RGB image: blue=low-rank, orange=dense, white=empty
-function build_rgb_from_blockmap(img, N; lr_color=(0.18, 0.42, 0.73), dense_color=(0.88, 0.35, 0.14))
-    rgb = ones(N, N, 3)  # white background
-    for j in 1:N, i in 1:N
-        v = img[i, j]
-        if v == -1
-            rgb[i, j, 1] = dense_color[1]
-            rgb[i, j, 2] = dense_color[2]
-            rgb[i, j, 3] = dense_color[3]
-        elseif v > 0
-            rgb[i, j, 1] = lr_color[1]
-            rgb[i, j, 2] = lr_color[2]
-            rgb[i, j, 3] = lr_color[3]
-        end
-    end
-    return rgb
-end
-
 img_h = zeros(Float64, N, N)
 paint_hmatrix!(img_h, hmat)
-rgb_h = build_rgb_from_blockmap(img_h, N)
 
 shapes_h = Tuple{Float64,Float64,Float64,Float64,Bool}[]
 block_boundaries_hmat!(shapes_h, hmat)
@@ -140,18 +131,19 @@ p2 = plot(; size=(500, 480), dpi=200, aspect_ratio=:equal,
     framestyle=:box)
 # Plot the RGB image as a heatmap by using the block map values
 heatmap!(p2, 1:N, 1:N, img_h'; yflip=true,
-    color=cgrad([RGB(0.88, 0.35, 0.14), RGB(1,1,1), RGB(0.18, 0.42, 0.73)],
-                [-1, 0, 1]),
-    clims=(-1.5, maximum(img_h) + 0.5),
+    color=rank_cgrad(maximum(img_h)),
+    clims=(-1, max(maximum(img_h), 1)),
     colorbar=false)
 for (x1, x2, y1, y2, _) in shapes_h
     plot!(p2, [x1, x2, x2, x1, x1], [y1, y1, y2, y2, y1];
         color=:black, linewidth=0.4, label=false)
 end
-scatter!(p2, [-10], [-10]; color=RGB(0.18, 0.42, 0.73), markershape=:rect,
-    markersize=8, label="Low-rank (admissible)")
-scatter!(p2, [-10], [-10]; color=RGB(0.88, 0.35, 0.14), markershape=:rect,
-    markersize=8, label="Dense (near-field)")
+scatter!(p2, [-10], [-10]; color=LOW_RANK_COLOR, markershape=:rect,
+    markersize=8, label="Low rank")
+scatter!(p2, [-10], [-10]; color=HIGH_RANK_COLOR, markershape=:rect,
+    markersize=8, label="Higher rank")
+scatter!(p2, [-10], [-10]; color=DENSE_COLOR, markershape=:rect,
+    markersize=8, label="Dense near-field")
 savefig(p2, joinpath(ASSETS, "hmatrix_structure.png"))
 println("  → hmatrix_structure.png")
 
@@ -212,18 +204,19 @@ p3 = plot(; size=(500, 480), dpi=200, aspect_ratio=:equal,
     xlims=(0.5, N + 0.5), ylims=(0.5, N + 0.5), yflip=true,
     framestyle=:box)
 heatmap!(p3, 1:N, 1:N, img_h2'; yflip=true,
-    color=cgrad([RGB(0.88, 0.35, 0.14), RGB(1,1,1), RGB(0.16, 0.55, 0.28)],
-                [-1, 0, 1]),
-    clims=(-1.5, maximum(img_h2) + 0.5),
+    color=rank_cgrad(maximum(img_h2)),
+    clims=(-1, max(maximum(img_h2), 1)),
     colorbar=false)
 for (x1, x2, y1, y2, _) in shapes_h2
     plot!(p3, [x1, x2, x2, x1, x1], [y1, y1, y2, y2, y1];
         color=:black, linewidth=0.4, label=false)
 end
-scatter!(p3, [-10], [-10]; color=RGB(0.16, 0.55, 0.28), markershape=:rect,
-    markersize=8, label="Uniform (shared basis)")
-scatter!(p3, [-10], [-10]; color=RGB(0.88, 0.35, 0.14), markershape=:rect,
-    markersize=8, label="Dense (near-field)")
+scatter!(p3, [-10], [-10]; color=LOW_RANK_COLOR, markershape=:rect,
+    markersize=8, label="Low-rank uniform")
+scatter!(p3, [-10], [-10]; color=HIGH_RANK_COLOR, markershape=:rect,
+    markersize=8, label="Higher-rank uniform")
+scatter!(p3, [-10], [-10]; color=DENSE_COLOR, markershape=:rect,
+    markersize=8, label="Dense near-field")
 savefig(p3, joinpath(ASSETS, "h2matrix_structure.png"))
 println("  → h2matrix_structure.png")
 
@@ -236,6 +229,8 @@ p4 = plot(p2, p3; layout=(1, 2), size=(1050, 480), dpi=200,
     plot_title="H-Matrix vs H²-Matrix Compression")
 savefig(p4, joinpath(ASSETS, "h_vs_h2_comparison.png"))
 println("  → h_vs_h2_comparison.png")
+savefig(p4, joinpath(ASSETS, "h_and_h2_matrix_block_structures.png"))
+println("  → h_and_h2_matrix_block_structures.png")
 
 # ──────────────────────────────────────────────────────────────────
 # Figure 5: Approximation error heatmaps
@@ -305,9 +300,8 @@ p7a = plot(; size=(500, 480), aspect_ratio=:equal, framestyle=:box,
     xlims=(0.5, N+0.5), ylims=(0.5, N+0.5), yflip=true,
     tickfontsize=8, guidefontsize=10, titlefontsize=10)
 heatmap!(p7a, 1:N, 1:N, img_before'; yflip=true,
-    color=cgrad([RGB(0.88, 0.35, 0.14), RGB(1,1,1), RGB(0.16, 0.55, 0.28)],
-                [-1, 0, 1]),
-    clims=(-1.5, max_rk_recomp + 0.5), colorbar=false)
+    color=rank_cgrad(max_rk_recomp),
+    clims=(-1, max_rk_recomp), colorbar=false)
 
 p7b = plot(; size=(500, 480), aspect_ratio=:equal, framestyle=:box,
     xlabel="Column", ylabel="Row",
@@ -315,9 +309,8 @@ p7b = plot(; size=(500, 480), aspect_ratio=:equal, framestyle=:box,
     xlims=(0.5, N+0.5), ylims=(0.5, N+0.5), yflip=true,
     tickfontsize=8, guidefontsize=10, titlefontsize=10)
 heatmap!(p7b, 1:N, 1:N, img_after'; yflip=true,
-    color=cgrad([RGB(0.88, 0.35, 0.14), RGB(1,1,1), RGB(0.16, 0.55, 0.28)],
-                [-1, 0, 1]),
-    clims=(-1.5, max_rk_recomp + 0.5), colorbar=false)
+    color=rank_cgrad(max_rk_recomp),
+    clims=(-1, max_rk_recomp), colorbar=false)
 
 p7 = plot(p7a, p7b; layout=(1, 2), size=(1050, 480), dpi=200,
     plot_title="H² Recompression: Rank Reduction")
