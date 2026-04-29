@@ -199,6 +199,12 @@ function compression_ratio(h::H2Matrix)
 end
 
 function _storage_bytes(h::H2Matrix)
+    return _block_storage_bytes(h) +
+           _basis_storage_bytes(h.row_basis) +
+           _basis_storage_bytes(h.col_basis)
+end
+
+function _block_storage_bytes(h::H2Matrix)
     if isleaf(h)
         if h.uniform !== nothing
             return sizeof(h.uniform.S)
@@ -210,10 +216,18 @@ function _storage_bytes(h::H2Matrix)
     else
         s = 0
         for child in h.children
-            s += _storage_bytes(child)
+            s += _block_storage_bytes(child)
         end
         return s
     end
+end
+
+function _basis_storage_bytes(cb::ClusterBasis)
+    s = sizeof(cb.V) + sizeof(cb.E)
+    for child in cb.children
+        s += _basis_storage_bytes(child)
+    end
+    return s
 end
 
 """
