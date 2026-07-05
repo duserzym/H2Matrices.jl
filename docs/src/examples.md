@@ -12,6 +12,50 @@ easy to audit. For large examples, prefer sampled entry checks or sampled
 matvec checks with [`relative_matvec_error`](@ref) and
 [`sampled_frobenius_error`](@ref).
 
+## How to Read These Examples
+
+An H²-matrix is still just a matrix. The difference is that we never want to
+store all of its entries when the matrix is large.
+
+In these examples, the dense matrix would have entries
+
+```math
+K_{ij} = G(x_i, y_j),
+```
+
+where:
+
+- ``x_i`` is the point associated with row ``i``.
+- ``y_j`` is the point associated with column ``j``.
+- ``G`` is the kernel that tells us how strongly point ``y_j`` affects point
+  ``x_i``.
+- A matrix-vector product ``u = K q`` means: given source strengths ``q_j``,
+  accumulate the field or potential ``u_i`` at every target point.
+
+The package does not need the full dense matrix. It needs:
+
+1. **Point coordinates** so it can decide which groups of rows and columns are
+   geometrically close or far apart.
+2. **A kernel function** so it can evaluate individual entries when needed.
+3. **Cluster trees** so it can organize the points into boxes at multiple
+   scales.
+4. **An admissibility rule** so close interactions stay exact/dense and far
+   interactions are compressed.
+
+For micromagnetics, the closest analogy is the boundary-element part of the
+demagnetizing-field calculation. Boundary nodes interact nonlocally through a
+smooth Green's-function-like operator. That boundary-to-boundary matrix is dense
+if stored directly, but its far-field blocks are compressible. Local FEM
+operators such as exchange, anisotropy, and Zeeman terms are different: they are
+sparse or pointwise/local and are better handled as sparse or matrix-free
+operators rather than H² matrices.
+
+!!! note "Dense references are teaching tools"
+    Several examples below build `K_dense` to measure the approximation error.
+    That is only appropriate for small examples. In production, the whole point
+    is to keep the operator compressed and validate with sampled entries,
+    sampled matvecs, or physics-specific regression tests.
+
 ## Visualizing Matrix Compression
 
 To build intuition, let's start with a visual overview of how H-matrices and
@@ -98,18 +142,28 @@ Random.seed!(42)
 
 # --- Setup ---
 N = 300
+
+# Rows and columns of the matrix are represented by point coordinates.
+# Here the two point clouds are deliberately separated in x so that many
+# row/column cluster pairs are far enough apart to be compressed.
 src = [SVector{2,Float64}(rand(), rand()) for _ in 1:N]
 tgt = [SVector{2,Float64}(2.0 + rand(), rand()) for _ in 1:N]
 
+# This object behaves like a dense matrix whose entry (i,j) is obtained by
+# evaluating the kernel at one row point and one column point. The entries are
+# computed lazily; no N x N array is allocated here.
 K = KernelMatrix(src, tgt) do x, y
     r = norm(x - y)
     r > 0 ? 1 / (4π * r) : 0.0
 end
 
+# ClusterTree reorders the point arrays in place, so pass a copy unless you
+# intentionally want the original point order mutated.
 Xclt = ClusterTree(deepcopy(src), GeometricSplitter(; nmax=30))
 Yclt = ClusterTree(deepcopy(tgt), GeometricSplitter(; nmax=30))
 
 # --- Dense reference (for error measurement) ---
+# This block is here only because N is small. It gives us a ground-truth matvec.
 K_dense = Matrix{Float64}(undef, N, N)
 for j in 1:N, i in 1:N
     K_dense[i, j] = K[i, j]
@@ -118,17 +172,24 @@ x = randn(N)
 y_ref = K_dense * x
 
 # --- Method 1: Chebyshev interpolation ---
+# Chebyshev assembly is deterministic. The order is per spatial dimension, so
+# order=4 in 2D gives a nominal interpolation rank of 4^2 = 16 per cluster.
 h2_cheb = assemble_h2matrix(K, Xclt, Yclt; order=4, global_index=true)
 println("Chebyshev (order=4):  error = ", norm(h2_cheb * x - y_ref) / norm(y_ref))
 println("  compression ratio = ", H2Matrices.compression_ratio(h2_cheb))
 
 # --- Method 2: Adaptive ACA → H² ---
+# Adaptive assembly first samples matrix entries to find low-rank structure,
+# then converts the result to nested H² bases. This is often a better default
+# when the effective rank is not obvious ahead of time.
 h2_ada = assemble_h2matrix_adaptive(K, Xclt, Yclt; rtol=1e-6, maxrank=50)
 println("Adaptive (rtol=1e-6): error = ", norm(h2_ada * x - y_ref) / norm(y_ref))
 println("  compression ratio = ", H2Matrices.compression_ratio(h2_ada))
 println("  rank summary = ", H2Matrices.rank_stats(h2_ada))
 
 # --- Recompression ---
+# Recompression is useful when the initial ranks are conservative. It reduces
+# the nested bases and updates the coupling matrices in place.
 h2_recomp = assemble_h2matrix(K, Xclt, Yclt; order=5, global_index=true)
 rank_before = H2Matrices.total_rank(h2_recomp.row_basis)
 recompress!(h2_recomp; rtol=1e-4, maxrank=50)
@@ -237,6 +298,56 @@ Summary: (size = (200, 200), ..., compression_ratio = ...)
 The source and target point sets for this example:
 
 ![Point geometry](assets/ex3_points.png)
+
+## Micromagnetics Interpretation
+
+The examples above use scalar Laplace kernels because they are small, familiar,
+and easy to check against dense references. A finite-element micromagnetics code
+usually has a more structured operator split:
+
+| Term | Mathematical character | Recommended representation |
+|:-----|:-----------------------|:---------------------------|
+| Demagnetizing BEM boundary coupling | nonlocal boundary-to-boundary interaction | H² matrix |
+| Demagnetizing FEM volume operators | local finite-element gradient/divergence/stiffness operators | sparse or matrix-free |
+| Exchange | local finite-element stiffness operator | sparse or matrix-free |
+| Anisotropy | local nonlinear material law | direct local field evaluation |
+| Zeeman | applied external field | direct vector contribution |
+
+The H² part is most valuable for the dense boundary coupling. For example, in a
+Fredkin-Koehler-style FEM/BEM demag calculation, one step has the form
+
+```math
+u_{\partial\Omega}^{(2)} = B_{\partial\Omega,\partial\Omega}
+u_{\partial\Omega}^{(1)},
+```
+
+where ``B`` maps boundary potentials to boundary potentials. Stored densely,
+``B`` costs ``O(N_b^2)`` memory. Stored as an H² matrix, the same operator can
+often be applied in near-linear memory and time, while the surrounding FEM
+operators remain local.
+
+The implementation pattern is:
+
+```julia
+# Boundary coordinates define the row/column geometry.
+boundary_points = [SVector{3,Float64}(coords[:, j]) for j in boundary_nodes]
+
+# The kernel computes a single boundary interaction entry.
+K_boundary = KernelMatrix(boundary_points, boundary_points) do x, y
+    # Replace this toy expression with the actual boundary integral entry.
+    r = norm(x - y)
+    r > 0 ? 1 / (4π * r) : 0.0  # use the correct diagonal limit in real BEM code
+end
+
+# The compressed operator replaces a dense boundary matrix in mul!.
+B_h2 = assemble_h2matrix_adaptive(K_boundary; rtol=1e-6, maxrank=80, nmax=32)
+u2 = B_h2 * u1
+```
+
+In real demag assembly, the kernel entry may involve triangle integrals,
+solid-angle diagonal terms, or a wrapper around an existing boundary-element
+entry evaluator. That is fine: H² assembly only requires point geometry and a
+way to query selected matrix entries.
 
 ## Example 4: H-Matrix to H²-Matrix Conversion
 
