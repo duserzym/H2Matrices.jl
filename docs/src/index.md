@@ -1,5 +1,7 @@
 # H2Matrices.jl
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21748179.svg)](https://doi.org/10.5281/zenodo.21748179)
+
 *Fast hierarchical matrix algebra with nested bases in Julia.*
 
 ## What is an H²-matrix?
