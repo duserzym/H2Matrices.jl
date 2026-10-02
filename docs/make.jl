@@ -17,6 +17,7 @@ makedocs(;
         "Getting Started" => "getting_started.md",
         "Examples"        => "examples.md",
         "API Reference"   => "api.md",
+        "Accuracy and Performance" => "accuracy_performance.md",
     ],
 )
 

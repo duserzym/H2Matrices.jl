@@ -301,6 +301,84 @@ end
 
 Base.:*(h2::H2Matrix, x::AbstractVector) = mul!(zeros(size(h2, 1)), h2, x; global_index=h2.global_index)
 
+# Real H2 operators reuse their bases and numerical blocks for both transpose
+# and adjoint products. No independently compressed companion is needed.
+const TransposedH2Matrix = Union{Transpose{Float64,<:H2Matrix},Adjoint{Float64,<:H2Matrix}}
+
+function _transpose_interaction!(out_coeffs, h2::H2Matrix, in_coeffs)
+    if isleaf(h2)
+        if h2.uniform !== nothing && h2.row_basis.k > 0 && h2.col_basis.k > 0
+            mul!(out_coeffs[h2.col_basis], h2.uniform.S',
+                 in_coeffs[h2.row_basis], 1.0, 1.0)
+        end
+    else
+        for child in h2.children
+            _transpose_interaction!(out_coeffs, child, in_coeffs)
+        end
+    end
+end
+
+function _transpose_nearfield!(y, h2::H2Matrix, x, row_offset, col_offset)
+    if isleaf(h2)
+        if h2.dense !== nothing
+            ir = index_range(h2.row_basis.cluster) .- row_offset
+            jr = index_range(h2.col_basis.cluster) .- col_offset
+            mul!(view(y, jr), h2.dense', view(x, ir), 1.0, 1.0)
+        end
+    else
+        for child in h2.children
+            _transpose_nearfield!(y, child, x, row_offset, col_offset)
+        end
+    end
+end
+
+function _transpose_h2matvec!(y, h2::H2Matrix, x; global_index=h2.global_index)
+    rc = h2.row_basis.cluster
+    cc = h2.col_basis.cluster
+    x_local = global_index ? x[loc2glob(rc)] : x
+    global_index && permute!(y, loc2glob(cc))
+    in_coeffs = allocate_coefficients(h2.row_basis)
+    out_coeffs = allocate_coefficients(h2.col_basis)
+    forward_transform!(in_coeffs, h2.row_basis, x_local)
+    _transpose_interaction!(out_coeffs, h2, in_coeffs)
+    backward_transform!(y, out_coeffs, h2.col_basis)
+    _transpose_nearfield!(y, h2, x_local,
+        first(index_range(rc)) - 1, first(index_range(cc)) - 1)
+    global_index && invpermute!(y, loc2glob(cc))
+    return y
+end
+
+"""
+    mul!(y, adjoint(h2), x, alpha=1, beta=0)
+
+Apply the exact transpose of the stored real H2 approximation using the same
+bases, couplings and near-field blocks. Supports rectangular operators and
+independent row and column permutations; allocates only matvec scratch data.
+"""
+function LinearAlgebra.mul!(y::AbstractVector, A::TransposedH2Matrix,
+                            x::AbstractVector, alpha::Number=1, beta::Number=0;
+                            global_index::Bool=parent(A).global_index)
+    h2 = parent(A)
+    length(x) == size(h2, 1) && length(y) == size(h2, 2) ||
+        throw(DimensionMismatch("incompatible H2 transpose matvec dimensions"))
+    if iszero(beta)
+        fill!(y, zero(eltype(y)))
+    elseif beta != 1
+        rmul!(y, beta)
+    end
+    iszero(alpha) && return y
+    if alpha == 1
+        _transpose_h2matvec!(y, h2, x; global_index)
+    else
+        tmp = zeros(eltype(y), length(y))
+        _transpose_h2matvec!(tmp, h2, x; global_index)
+        axpy!(alpha, tmp, y)
+    end
+    return y
+end
+
+Base.:*(A::TransposedH2Matrix, x::AbstractVector) = mul!(zeros(size(A, 1)), A, x)
+
 # ──────────────────────────────────────────────────────────────────
 # Helper: find root cluster
 # ──────────────────────────────────────────────────────────────────

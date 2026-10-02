@@ -27,9 +27,9 @@ with shared nested cluster bases.
 
 The algorithm:
 1. Collect per-block low-rank data (RkMatrix = A * B') from admissible leaves
-2. Build row basis bottom-up: at leaves stack A columns → SVD → truncate;
-   at non-leaves project through children → SVD → transfer matrices
-3. Build column basis similarly using B columns
+2. Build row bases from partner-QR-weighted factors, including inherited
+   interactions at every level, then project through children to build transfers
+3. Build column bases similarly, leaving unused parent bases empty
 4. Mirror the H-matrix block tree as H²-matrix block tree
 5. Compute coupling matrices by projecting RkMatrix data through the
    nested bases: S = (V_τ' A)(W_σ' B)'
@@ -38,6 +38,9 @@ The algorithm:
 - `hmat` : an assembled HMatrix from HMatrices.jl
 - `rtol` : relative truncation tolerance for basis rank
 - `maxrank` : maximum allowed rank per cluster
+- `global_index` : whether matvec inputs and outputs use global DOF ordering
+- `strict` : throw if the rank cap prevents any requested local SVD tolerance;
+  otherwise warn. Local tolerances are not a global operator error certificate.
 
 # Returns
 An `H2Matrix` approximating the same kernel.
@@ -45,7 +48,11 @@ An `H2Matrix` approximating the same kernel.
 function compress_hmatrix_to_h2(hmat::HMatrix;
                                 rtol::Float64=1e-8,
                                 maxrank::Int=50,
+                                global_index::Bool=true,
+                                strict::Bool=false,
                                 _print::Bool=true)
+    isfinite(rtol) && rtol >= 0 || throw(ArgumentError("rtol must be finite and nonnegative"))
+    maxrank > 0 || throw(ArgumentError("maxrank must be positive"))
     rt = HMatrices.rowtree(hmat)
     ct = HMatrices.coltree(hmat)
 
@@ -62,12 +69,18 @@ function compress_hmatrix_to_h2(hmat::HMatrix;
 
     # Build row basis from A matrices (bottom-up with propagation)
     empty_inherited = Tuple{Matrix{Float64},UnitRange{Int}}[]
+    capped_residuals = Float64[]
     _build_adaptive_basis_recursive!(rb, row_data, empty_inherited;
-                                      rtol, maxrank, is_row=true)
+                                      rtol, maxrank, is_row=true, capped_residuals)
 
     # Build col basis from B matrices (bottom-up with propagation)
     _build_adaptive_basis_recursive!(cb, col_data, Tuple{Matrix{Float64},UnitRange{Int}}[];
-                                      rtol, maxrank, is_row=false)
+                                      rtol, maxrank, is_row=false, capped_residuals)
+
+    if !isempty(capped_residuals)
+        message = "H2 basis rank cap prevents the requested local tolerance at $(length(capped_residuals)) clusters; largest relative discarded singular value = $(maximum(capped_residuals)). Increase maxrank."
+        strict ? throw(ArgumentError(message)) : (@warn message)
+    end
 
     # Mirror H-matrix block tree as H² block tree
     h2 = _mirror_hmat_to_h2(hmat, row_map, col_map)
@@ -75,7 +88,7 @@ function compress_hmatrix_to_h2(hmat::HMatrix;
     # Fill coupling matrices and dense blocks from H-matrix data
     _fill_h2_from_hmat!(h2, hmat, row_map, col_map)
 
-    h2.global_index = true
+    h2.global_index = global_index
     _print && _print_compression_summary(h2)
     return h2
 end
@@ -155,7 +168,8 @@ function _build_adaptive_basis_recursive!(
     inherited::Vector{Tuple{Matrix{Float64},UnitRange{Int}}};
     rtol::Float64=1e-8,
     maxrank::Int=50,
-    is_row::Bool=true
+    is_row::Bool=true,
+    capped_residuals::Vector{Float64}=Float64[]
 ) where {N,T}
     my_range = index_range(cb.cluster)
 
@@ -164,7 +178,12 @@ function _build_adaptive_basis_recursive!(
     direct_matrices = Matrix{Float64}[]
     if my_direct_entries !== nothing
         for b in my_direct_entries
-            push!(direct_matrices, is_row ? b.A : b.B)
+            # AB' = (A R_B') Q_B'. The partner Q is isometric, so
+            # these weighted columns measure block error independently of
+            # arbitrary scaling of ACA's individual factor columns.
+            partner = is_row ? b.B : b.A
+            factor = is_row ? b.A : b.B
+            push!(direct_matrices, factor * Matrix(qr(partner).R)')
         end
     end
 
@@ -188,6 +207,7 @@ function _build_adaptive_basis_recursive!(
             C = hcat(all_active...)
             F = svd(C)
             k = _truncation_rank(F.S, rtol, maxrank)
+            _record_rank_cap!(capped_residuals, F.S, k, rtol, maxrank)
             cb.V = F.U[:, 1:k]
             cb.k = k
         end
@@ -203,7 +223,7 @@ function _build_adaptive_basis_recursive!(
         # 5. Recurse on children (bottom-up)
         for child in cb.children
             _build_adaptive_basis_recursive!(child, data, new_inherited;
-                                              rtol, maxrank, is_row)
+                                              rtol, maxrank, is_row, capped_residuals)
         end
 
         # 6. Build transfer matrices
@@ -215,16 +235,16 @@ function _build_adaptive_basis_recursive!(
             for child in cb.children
                 child.E = zeros(Float64, 0, 0)
             end
-        elseif isempty(direct_matrices)
-            # No direct blocks at this level → identity embedding
-            # (inherited blocks are handled through children's bases already)
-            _set_identity_embedding!(cb, child_ks, total_child_k)
+        elseif isempty(all_active)
+            # This cluster participates in no direct or ancestor far-field
+            # interactions. Child-local interactions do not need a parent basis.
+            _set_empty_parent_basis!(cb)
         else
-            # Project direct block data through children's bases
+            # Preserve both direct and inherited interactions in this basis.
             irange = index_range(cb.cluster)
             projected_cols = Matrix{Float64}[]
 
-            for M in direct_matrices
+            for M in all_active
                 proj = _project_through_children(cb, M, irange, child_ks, total_child_k)
                 push!(projected_cols, proj)
             end
@@ -232,9 +252,10 @@ function _build_adaptive_basis_recursive!(
             C = hcat(projected_cols...)
             F = svd(C)
             k = _truncation_rank(F.S, rtol, maxrank)
+            _record_rank_cap!(capped_residuals, F.S, k, rtol, maxrank)
 
             if k == 0
-                _set_identity_embedding!(cb, child_ks, total_child_k)
+                _set_empty_parent_basis!(cb)
             else
                 cb.k = k
                 U_k = F.U[:, 1:k]
@@ -245,6 +266,21 @@ function _build_adaptive_basis_recursive!(
                 end
             end
         end
+    end
+    return cb
+end
+
+function _record_rank_cap!(residuals, singular_values, k, rtol, maxrank)
+    if k == maxrank && k < length(singular_values) &&
+       singular_values[k+1] > rtol * singular_values[1]
+        push!(residuals, singular_values[k+1] / singular_values[1])
+    end
+end
+
+function _set_empty_parent_basis!(cb)
+    cb.k = 0
+    for child in cb.children
+        child.E = zeros(Float64, child.k, 0)
     end
     return cb
 end
@@ -261,9 +297,8 @@ function _project_through_children(cb, M, parent_irange, child_ks, total_child_k
         child_irange = index_range(child.cluster)
         local_start = child_irange.start - parent_irange.start + 1
         local_end = child_irange.stop - parent_irange.start + 1
-        M_child = M[local_start:local_end, :]  # |child| × cols
-        V_child = _full_basis(child)             # |child| × k_child
-        proj[(offset+1):(offset+child.k), :] = V_child' * M_child
+        M_child = view(M, local_start:local_end, :)
+        proj[(offset+1):(offset+child.k), :] = _compress_basis_matrix(child, M_child)
         offset += child.k
     end
     return proj
@@ -414,10 +449,14 @@ end
 # ════════════════════════════════════════════════════════════════════
 
 """
-    recompress!(h2; rtol=1e-8, maxrank=50)
+    recompress!(h2; rtol=1e-8, maxrank=50, strict=false)
 
 Recompress an H²-matrix in place, reducing basis ranks while maintaining
 accuracy within the specified tolerance.
+
+`strict=true` rejects insufficient rank caps and leaves the original operator
+unchanged on failure, using a temporary copy. Rebuild matvec plans after success.
+Tolerances control local truncations, not a certified global error bound.
 
 Uses the weight-based recompression algorithm (Börm):
 1. Compute basis weights (QR factors encoding basis conditioning)
@@ -426,9 +465,22 @@ Uses the weight-based recompression algorithm (Börm):
 4. Truncate bases (bottom-up SVD using total weights)
 5. Project coupling matrices through basis change operators
 """
-function recompress!(h2::H2Matrix{N,T};
-                     rtol::Float64=1e-8,
-                     maxrank::Int=50) where {N,T}
+function recompress!(h2::H2Matrix; rtol::Float64=1e-8, maxrank::Int=50,
+                     strict::Bool=false)
+    isfinite(rtol) && rtol >= 0 || throw(ArgumentError("rtol must be finite and nonnegative"))
+    maxrank > 0 || throw(ArgumentError("maxrank must be positive"))
+    # Strict failures leave the caller's original operator unchanged.
+    target = strict ? copy(h2) : h2
+    _recompress_impl!(target; rtol, maxrank, strict)
+    if strict
+        h2.row_basis=target.row_basis; h2.col_basis=target.col_basis
+        h2.uniform=target.uniform; h2.dense=target.dense; h2.children=target.children
+    end
+    h2
+end
+
+function _recompress_impl!(h2::H2Matrix{N,T}; rtol, maxrank, strict) where {N,T}
+    capped_residuals = Float64[]
     # ── Step 1: Compute basis weights ──
     col_weights = _compute_basis_weights(h2.col_basis)
     row_weights = _compute_basis_weights(h2.row_basis)
@@ -442,12 +494,15 @@ function recompress!(h2::H2Matrix{N,T};
     col_total = _accumulate_total_weights(h2.col_basis, col_local)
 
     # ── Step 4: Truncate bases (bottom-up) ──
-    row_changes = _truncate_basis!(h2.row_basis, row_total; rtol, maxrank)
-    col_changes = _truncate_basis!(h2.col_basis, col_total; rtol, maxrank)
+    row_changes = _truncate_basis!(h2.row_basis, row_total; rtol, maxrank, capped_residuals)
+    col_changes = _truncate_basis!(h2.col_basis, col_total; rtol, maxrank, capped_residuals)
 
     # ── Step 5: Project coupling matrices ──
     _project_coupling_matrices!(h2, row_changes, col_changes)
-
+    if !isempty(capped_residuals)
+        message="H2 recompression rank cap prevents requested local tolerance at $(length(capped_residuals)) bases (worst relative residual $(maximum(capped_residuals)))"
+        strict ? throw(ArgumentError(message)) : (@warn message)
+    end
     return h2
 end
 
@@ -639,15 +694,19 @@ At non-leaf: V̂ = [C_1*E_1; C_2*E_2; ...], M = V̂ * Z', SVD → new E, C
 function _truncate_basis!(cb::ClusterBasis{N,T},
                           total_weights::Dict{UInt,Matrix{Float64}};
                           rtol::Float64,
-                          maxrank::Int) where {N,T}
+                          maxrank::Int, capped_residuals=Float64[]) where {N,T}
     changes = Dict{UInt,Matrix{Float64}}()
-    _truncate_recursive!(changes, cb, total_weights; rtol, maxrank)
+    _truncate_recursive!(changes, cb, total_weights; rtol, maxrank, capped_residuals)
     return changes
 end
 
 function _truncate_recursive!(changes, cb::ClusterBasis{N,T},
-                               total_weights; rtol, maxrank) where {N,T}
+                               total_weights; rtol, maxrank, capped_residuals) where {N,T}
     if cb.k == 0
+        for child in cb.children
+            _truncate_recursive!(changes, child, total_weights; rtol, maxrank, capped_residuals)
+            child.E = zeros(Float64, child.k, 0)
+        end
         changes[objectid(cb)] = zeros(Float64, 0, 0)
         return
     end
@@ -666,6 +725,7 @@ function _truncate_recursive!(changes, cb::ClusterBasis{N,T},
         M = V_old * Z'
         F = svd(M)
         k_new = _truncation_rank(F.S, rtol, maxrank)
+        _record_rank_cap!(capped_residuals, F.S, k_new, rtol, maxrank)
         k_new = max(k_new, 0)
 
         if k_new == 0
@@ -683,7 +743,7 @@ function _truncate_recursive!(changes, cb::ClusterBasis{N,T},
     else
         # Process children first (bottom-up)
         for child in cb.children
-            _truncate_recursive!(changes, child, total_weights; rtol, maxrank)
+            _truncate_recursive!(changes, child, total_weights; rtol, maxrank, capped_residuals)
         end
 
         # Form V̂ = [C_1 * E_1; C_2 * E_2; ...]
@@ -720,6 +780,7 @@ function _truncate_recursive!(changes, cb::ClusterBasis{N,T},
         M = V_hat * Z'
         F = svd(M)
         k_new = _truncation_rank(F.S, rtol, maxrank)
+        _record_rank_cap!(capped_residuals, F.S, k_new, rtol, maxrank)
         k_new = max(k_new, 0)
 
         if k_new == 0
@@ -795,6 +856,7 @@ because the ranks adapt to the actual kernel smoothness.
 - `rtol` : relative tolerance for H² basis truncation
 - `maxrank` : maximum rank per cluster
 - `aca_rtol` : tolerance for ACA (defaults to `rtol / 10`)
+- `strict` : reject a basis rank cap that prevents the local tolerance
 - `aca_kwargs...` : additional arguments for `assemble_hmatrix`
 """
 function assemble_h2matrix_adaptive(
@@ -806,6 +868,7 @@ function assemble_h2matrix_adaptive(
     aca_rtol::Union{Float64,Nothing}=nothing,
     adm=StrongAdmissibilityStd(3),
     global_index::Bool=true,
+    strict::Bool=false,
     kwargs...
 ) where {N,T}
     # Step 1: Build H-matrix via ACA
@@ -818,7 +881,7 @@ function assemble_h2matrix_adaptive(
                                        kwargs...)
 
     # Step 2: Convert to H²
-    h2 = compress_hmatrix_to_h2(hmat; rtol, maxrank, _print=false)
+    h2 = compress_hmatrix_to_h2(hmat; rtol, maxrank, global_index, strict, _print=false)
 
     _print_compression_summary(h2)
     return h2

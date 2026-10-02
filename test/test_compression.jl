@@ -9,7 +9,7 @@
 
         h2 = compress_hmatrix_to_h2(hmat; rtol=1e-6, maxrank=40)
         dense = dense_kernel_matrix(K, n)
-        @test H2Matrices.relative_matvec_error(h2, dense; nsamples=3) < 8e-2
+        @test norm(Matrix(h2) - dense) / norm(dense) < 5e-6
         @test H2Matrices.storage_bytes(h2) > 0
         @test H2Matrices.dense_storage_bytes(h2) / H2Matrices.storage_bytes(h2) ≈ H2Matrices.compression_ratio(h2)
     end
@@ -19,7 +19,7 @@
         K, rowtree, coltree = separated_laplace2d(n; seed=23)
         h2 = assemble_h2matrix_adaptive(K, rowtree, coltree; rtol=1e-6, maxrank=40)
         dense = dense_kernel_matrix(K, n)
-        @test H2Matrices.relative_matvec_error(h2, dense; nsamples=3) < 8e-2
+        @test norm(Matrix(h2) - dense) / norm(dense) < 5e-6
     end
 
     @testset "In-place recompression" begin

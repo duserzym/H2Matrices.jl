@@ -18,14 +18,22 @@ include("uniformblock.jl")
 include("h2matrix.jl")
 include("basis_construction.jl")
 include("matvec.jl")
+include("matvec_plan.jl")
 include("diagnostics.jl")
+storage_bytes(p::H2LowRankMatvecPlan) = _lowrank_plan_storage_bytes(p)
 include("assembly.jl")
 include("compression.jl")
 include("copying.jl")
+include("compact_plan.jl")
+include("packet_plan.jl")
 include("solvers.jl")
 include("plotting.jl")
 
-export ClusterBasis,
+export H2PacketMatvecPlan,
+    H2CompactMatvecPlan,
+    H2LowRankMatvecPlan,
+    H2MatvecPlan,
+    ClusterBasis,
     H2Matrix,
     UniformBlock,
     assemble_h2matrix,

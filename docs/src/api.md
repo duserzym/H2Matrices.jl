@@ -30,6 +30,10 @@ sampled_frobenius_error
 ## Matrix–Vector Product
 
 ```@docs
+H2MatvecPlan
+H2CompactMatvecPlan
+H2PacketMatvecPlan
+H2LowRankMatvecPlan
 h2matvec!
 forward_transform!
 backward_transform!

@@ -132,6 +132,103 @@ H²-matrix sampled entry error: ≈ 5e-4
   operators, e.g. integral equations, kernel methods, covariance matrices. Based on my testing, it is most effective for matrices of size `N > 10_000` (depending on the kernel and desired accuracy).
 
 
+## Accuracy and adjoints
+
+Adaptive conversion preserves direct and inherited far-field interactions in
+partner-QR-weighted nested bases. Unused parent bases have rank zero. Use
+`strict=true` to reject a rank cap that prevents the requested local SVD
+accuracy, and control initial ACA accuracy separately with `aca_rtol`:
+
+```julia
+h2 = assemble_h2matrix_adaptive(K; rtol=1e-9, aca_rtol=1e-10,
+                                maxrank=120, strict=true)
+y = h2 * x
+z = adjoint(h2) * y
+```
+
+`adjoint(h2)` and `transpose(h2)` apply the exact transpose of the stored real
+approximation. They reuse the existing bases and numerical blocks, including
+independent row and column permutations and rectangular matrices.
+
+The basis tolerance is local; it does not certify the total operator, field,
+or solver error. Validate against a trusted reference at the accuracy required
+by the application. Adaptive assembly still builds an H-matrix first, so peak
+construction memory is larger than final H2 storage.
+
+## Reusable matvec plans and recompression
+
+```julia
+plan = H2MatvecPlan(h2)
+mul!(y, plan, x)
+mul!(z, adjoint(plan), y)
+
+recompress!(h2; rtol=1e-8, maxrank=512, strict=true)
+plan = H2MatvecPlan(h2) # rebuild after changing the matrix
+```
+
+Plans flatten tree traversal, cache index permutations, and reuse coefficient
+and vector buffers. Their numerical blocks are shared with `h2`, so they do
+not duplicate the operator. Each concurrent worker needs its own plan; a
+single plan must not be used concurrently. Neither source bases nor blocks
+should be mutated while a plan is in use.
+
+Strict recompression rejects insufficient rank caps and leaves the original
+unchanged on failure. It uses a temporary copy, increasing peak setup memory.
+It visits active descendants even when their parent has rank zero.
+
+`H2LowRankMatvecPlan(h2; rtol=1e-10)` is an experimental matvec-only alternative
+that stores selected coupling matrices as SVD factors when those factors use
+less numeric storage. It retains bases and near-field blocks without retaining
+the original operator or discarded couplings. `storage_bytes(plan)` reports
+its numeric matrix storage, excluding scratch buffers and object overhead.
+The coupling tolerance introduces another local approximation and needs
+application-level validation; reduced storage does not guarantee faster
+products. Its adjoint uses exactly the same stored factors. It also requires
+one plan per worker and immutable shared numerical data.
+
+## Compact and packet plans (v0.1.1)
+
+```julia
+using LinearAlgebra
+BLAS.set_num_threads(1)
+
+compact = H2CompactMatvecPlan(h2)       # no extra truncation
+plan = H2PacketMatvecPlan(h2; workers=4)
+mul!(y, plan, x)
+mul!(z, adjoint(plan), y)
+worker_plan = copy(plan)               # shared matrices, independent scratch
+```
+
+The compact plan replaces saturated cluster bases with implicit identity
+bases and moves their numerical action into couplings and parent transfers.
+It works with nonorthogonal and overcomplete bases. This changes the stored
+representation up to floating-point rounding, without relaxing tolerances.
+The packet plan groups interactions into contiguous matrices and supports
+parallel execution with private transpose buffers and fixed reduction order.
+Overlapping near-field row ranges use a safe serial forward fallback.
+
+`workers=1` is the default and supports allocation-free warmed products on
+recent Julia compilers. Threaded plans allocate small task-scheduling objects.
+Always use one plan per concurrent caller: `copy(plan)` shares numerical data
+while copying all mutable scratch. Do not mutate shared numerical matrices
+or plan metadata while workers are active. Plans are matvec-only operators.
+
+On the real PLAG066 campaign grain (19,901 nodes, 100,602 tetrahedra, 6,028
+boundary nodes), the four-worker packet plan retained the original basis
+and ACA tolerances (`1e-10` and `1e-11`) while using 302.75 MB of numeric
+storage versus 337.78 MB for H2 and 378.59 MB for H. NEB polishing took
+52.2 s versus 53.9 s for H in paired single runs. Newly generated LEM/NEB
+states differed from H by at most 5.5e-11 T in tangent torque. These results
+are specific to this grain and path, not a general performance guarantee.
+Construction still uses a temporary H matrix; final storage is not peak RSS.
+
+For the unregistered package, install a reproducible release with:
+
+```julia
+using Pkg
+Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.1")
+```
+
 ## Documentation
 
 For more information, see the
