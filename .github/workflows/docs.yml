@@ -14,17 +14,23 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      JULIA_NUM_THREADS: '4'
+      OPENBLAS_NUM_THREADS: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1'
+      - uses: julia-actions/cache@v2
       - name: Install dependencies
         run: |
           julia --project=docs -e '
             using Pkg
             Pkg.develop(PackageSpec(path=pwd()))
             Pkg.instantiate()'
+      - name: Verify the runnable accuracy example
+        run: julia --project=docs docs/src/assets/accuracy_and_plans.jl
       - name: Build and deploy
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
