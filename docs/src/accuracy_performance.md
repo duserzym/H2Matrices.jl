@@ -1,66 +1,128 @@
 # Accuracy and performance
 
-Adaptive assembly uses ACA followed by nested-basis conversion. Set the ACA
-and basis tolerances independently, and use strict rank-cap checks:
+Use separate controls for ACA accuracy, nested-basis truncation and optional coupling truncation. For repeated products, choose a reusable representation and validate both its forward product and the adjoint used by the application. [How the advances work](advances.md) explains the algebra and implementation; [PLAG066 validation](validation.md) gives the measured results and their scope.
+
+## Assemble with explicit error controls
+
+Julia 1.13 or later is required for v0.1.2. `K` below is an existing `HMatrices.KernelMatrix`:
 
 ```julia
 using H2Matrices, LinearAlgebra
 h2 = assemble_h2matrix_adaptive(K;
-    rtol=1e-10, aca_rtol=1e-11, maxrank=512, strict=true)
-BLAS.set_num_threads(1)
-plan = H2PacketMatvecPlan(h2; workers=4)
-mul!(y, plan, x)
-mul!(z, adjoint(plan), y)
+    rtol=1e-10, aca_rtol=1e-11, maxrank=512,
+    nmax=32, strict=true)
 ```
 
-These parameters are an example, not universal accuracy requirements.
-A local truncation tolerance is not a certificate of total field or solver
-error. Check independent forward/adjoint products and physical observables
-against a trusted reference. Tightening tolerance cannot overcome a rank cap.
+| Control | What it controls | What it does not establish |
+|---|---|---|
+| `aca_rtol` | Independent H-block ACA construction | Total physical-field or solver error |
+| `rtol` | Local nested-basis singular-value truncation | A global relative error bound |
+| `maxrank` | Maximum retained basis rank | Accuracy if the required rank exceeds the cap |
+| `strict=true` | Reject a cap that violates a requested local threshold | Mesh, path or whole-campaign convergence |
+| `coupling_rtol` | Additional local coupling SVD truncation when requested | The original stored operator's accuracy without new checks |
+| `nmax`, admissibility | Tree/block partitioning and resulting ranks/work | A mesh-independent best configuration |
 
-## Reusable representations
+These are the validated PLAG066 parameters, not universal defaults. Tightening `rtol` cannot repair an insufficient rank cap, incomplete basis construction, or an energy-gradient inconsistency. Near-field blocks remain dense.
 
-`H2MatvecPlan` shares the source operator's matrices and reuses scratch.
-`H2CompactMatvecPlan` replaces saturated bases with implicit identity bases,
-keeping their action in couplings and transfers. No orthogonality assumption
-or truncation is required. `H2PacketMatvecPlan` packs interactions into
-contiguous matrices; packing changes only floating-point summation order.
-These plans are matvec-only operators.
+## Choose the product representation
 
-The packet plan defaults to one worker. Multiple workers use private adjoint
-reduction buffers and fixed reduction order. Near-field forward products
-fall back to serial execution if output row ranges overlap. Set BLAS to one
-thread when using packet workers, and measure your own grain/workload.
-Thread scheduling incurs small allocations; the single-worker warmed path
-is allocation-free on tested recent Julia compilers.
+| Representation | Main purpose | Additional approximation | Original H² object retained? |
+|---|---|---|---|
+| `H2Matrix` | Assembly, diagnostics, recompression and products | ACA/basis construction already chosen | It is the original object |
+| `H2MatvecPlan(h2)` | Cache traversal/permutations and reuse scratch | None | Yes |
+| `H2CompactMatvecPlan(h2)` | Also remove saturated bases via implicit identities | None by default | No object reference; some matrices are shared |
+| `H2PacketMatvecPlan(h2; workers=1)` | Compact bases plus contiguous interaction packets | None by default | No object reference; some matrices are shared |
+| `H2LowRankMatvecPlan(h2; rtol=...)` | Factor selected couplings to reduce storage | Local SVD truncation | No object reference; some matrices are shared |
 
-Plans contain mutable scratch and are not safe for concurrent calls.
-`copy(plan)` creates independent scratch, including factorized-coupling and
-packet buffers, while sharing numerical matrices. Never mutate shared data
-or plan metadata while workers are running. Rebuild plans after recompression
-or changes to the source matrix.
+Compact, packet and low-rank plans are matvec-only operators; they do not provide general matrix indexing or recompression. Keep an assembly representation only if those operations are needed. Plans retain the matrices and metadata needed for their products, so they remain usable after the source object goes out of scope.
 
-`H2LowRankMatvecPlan` and the compact plan's `coupling_rtol` option introduce
-an additional local SVD approximation. Those options require a separate error
-budget and application validation. They remain opt-in.
+## Repeated products and stored adjoints
 
-## Measured campaign grain
+```julia
+BLAS.set_num_threads(1)
+plan = H2PacketMatvecPlan(h2; workers=4)
+x = randn(size(plan, 2))
+z = randn(size(plan, 1))
+y = zeros(size(plan, 1))
+g = zeros(size(plan, 2))
 
-PLAG066 is a real PINT campaign mesh with 19,901 nodes, 100,602 tetrahedra,
-and 6,028 boundary nodes. At 570 °C, a four-worker packet plan retaining the
-original ACA/basis tolerances (1e-11/1e-10) used 302.75 MB of numeric storage,
-versus 337.78 MB for H2 and 378.59 MB for H. Forward/adjoint products measured
-3.36/2.61 ms. In paired single runs, NEB polishing took 52.2 s versus 53.9 s
-for H, with the same 345 iterations. LEM also retained its iteration count.
+mul!(y, plan, x)
+mul!(g, adjoint(plan), z)
+```
 
-Maximum H-reference torque discrepancy was 5.5e-11 T on newly generated LEM
-and NEB states. The barrier differed by 2.38e-10 kBT, and both maximum and RMS
-NEB residual checks passed. Fixed-state checks at 25 °C, 400 °C, and 570 °C
-cover 96 temperature/state combinations. These results validate this grain
-and path, not mesh refinement, all minima, or a whole temperature campaign.
+Use `adjoint(plan)` for the adjoint of this same stored approximation. Do not independently compress a transposed kernel and assume it is identical. A useful verification is `dot(z, plan*x) ≈ dot(adjoint(plan)*z, x)`, with a tolerance appropriate for accumulated rounding.
 
-Numeric storage excludes workspace and object overhead. The selected plan's
-Julia `summarysize` is 307.57 MB. Construction still temporarily holds H and
-H2 data, with additional packet packing buffers; final savings do not establish
-peak RSS savings. Separate worker copies share matrix data, reducing retained
-memory across independent callers.
+Use one BLAS thread when evaluating packet-worker speedups. Multiple packet workers and multiple BLAS threads can oversubscribe the processor. `workers=1` is the default; measure worker counts on the target grain and hardware. A one-worker warmed plan can avoid per-call allocations, while threaded paths create small scheduling objects.
+
+## Retain only the operator you need
+
+A standalone packet plan's storage reduction does not reduce the total live memory if the caller also retains H, H² and intermediate plans. For a product-only workload, limit their lifetimes:
+
+```julia
+function build_operator(K)
+    h2 = assemble_h2matrix_adaptive(K;
+        rtol=1e-10, aca_rtol=1e-11,
+        maxrank=512, nmax=32, strict=true)
+    return H2PacketMatvecPlan(h2; workers=4)
+end
+plan = build_operator(K)
+```
+
+After returning, unused assembly objects can be reclaimed; reclamation is governed by Julia's garbage collector. Construction still needs the intermediate H matrix, basis/SVD workspaces and packet packing buffers. This API does not establish a smaller peak assembly RSS.
+
+`storage_bytes(plan)` counts numerical basis, transfer, coupling and near-field data, excluding scratch and metadata. `Base.summarysize(plan)` estimates retained Julia object size, including scratch/metadata; it is not process RSS and does not include unrelated FEM data or BLAS workspaces. Summing `summarysize` across copies can double-count shared matrices.
+
+## Independent concurrent callers
+
+A plan contains mutable scratch and cannot serve concurrent products by itself. Use independent copies:
+
+```julia
+callers = [copy(plan) for _ in 1:2]
+inputs = [randn(size(plan, 2)) for _ in callers]
+outputs = [zeros(size(plan, 1)) for _ in callers]
+@sync for i in eachindex(callers)
+    Threads.@spawn mul!(outputs[i], callers[i], inputs[i])
+end
+```
+
+Copies share numerical matrices and traversal metadata, but own coefficient/vector scratch, factorized-coupling scratch and packet reduction buffers. Do not mutate shared data while any caller is running. When outer tasks already use the available CPU budget, one packet worker per caller can avoid excessive nested parallelism.
+
+Rebuild plans after successful recompression or source changes. `copy(plan)` creates a new workspace for the same representation; it does not rebuild it against a changed source.
+
+## Optional approximation reductions
+
+```julia
+compact = H2CompactMatvecPlan(h2; coupling_rtol=1e-10)
+# Alternatively:
+factored = H2LowRankMatvecPlan(h2; rtol=1e-10)
+```
+
+These options perform local coupling SVD truncation and require another accuracy check. Recompression and relaxed basis tolerances likewise need a physical error budget. Do not infer equivalent torque accuracy from equivalent storage size or from the same numerical tolerance at different stages.
+
+Strict recompression is transactional:
+
+```julia
+recompress!(h2; rtol=1e-9, maxrank=512, strict=true)
+# Rebuild any plans after success.
+```
+
+A rejected strict rank cap leaves `h2` unchanged. The temporary copy increases setup memory. Conversion and recompression traverse active children even when their parent has rank zero.
+
+## Validate before enlarging a campaign
+
+A practical sequence is:
+
+1. Compare forward and adjoint products with a trusted reference, including rectangular shapes and row/column ordering where relevant.
+2. Compare physical energy, field and tangent-torque errors on uniform/random states, minima and path images. Include temperatures/material states used in production.
+3. Check an energy directional derivative against a finite difference of the same stored operator.
+4. Run paired LEM and NEB solves from common seeds, endpoints and initial paths; evaluate both results with the same reference operator.
+5. Check maximum and RMS residuals, barriers, unit-spin constraints and endpoints independently of the solver's convergence flag.
+6. Measure retained memory, peak construction RSS and repeated-product/solver timing separately before increasing grain size or worker count.
+
+The package has a [runnable rectangular reference example](assets/accuracy_and_plans.jl), requiring no micromagnetic meshes or caches:
+
+```sh
+julia --project=. --threads=4 docs/src/assets/accuracy_and_plans.jl
+```
+
+It demonstrates dense-reference conversion checks, exact stored adjoints, compact/packet products and independent caller copies. It does not substitute for application-level grain validation. The full PLAG066 protocol and downloadable evidence are on the [validation page](validation.md).

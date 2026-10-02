@@ -10,7 +10,7 @@ So far this package is completely vibed out with AI agents, by feeding the HMatr
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.2")
+Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.3")
 ```
 
 ## Overview
@@ -22,6 +22,15 @@ matrices that exploit **shared nested bases** to achieve `O(N)` storage and
 matrix–vector product cost.  It builds on
 [HMatrices.jl](https://github.com/WaveProp/HMatrices.jl) for cluster trees,
 kernel matrices, and ACA.
+
+The recent accuracy-preserving improvements are documented in detail on the
+website: [algorithmic causes and changes](https://duserzym.github.io/H2Matrices.jl/stable/advances/),
+[practical configuration](https://duserzym.github.io/H2Matrices.jl/stable/accuracy_performance/),
+and [real-grain validation with downloadable data](https://duserzym.github.io/H2Matrices.jl/stable/validation/).
+The explanation covers inherited interactions, ACA factor weighting, stored
+adjoints, rank caps, implicit saturated bases, packet products and safe concurrency.
+The selected PLAG066 plan retains the original compression tolerances; the
+separate 244 MB relaxed-tolerance experiment is documented as an accuracy tradeoff.
 
 For the purpose of illustration, let us consider an abstract matrix `K` with
 entry `i,j` given by the evaluation of some _kernel function_ `G` on points
@@ -225,7 +234,7 @@ For the unregistered package, install a reproducible release with:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.2")
+Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.3")
 ```
 
 ## Documentation

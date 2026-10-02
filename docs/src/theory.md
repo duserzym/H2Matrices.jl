@@ -66,8 +66,8 @@ low-rank factors ``A_b, B_b``.  This gives ``O(N \log N)`` storage and
 matvec cost in general.
 
 An **H²-matrix** improves on this by introducing **shared nested bases**.
-Instead of storing separate factors per block, all blocks at the same level
-share a common **cluster basis**:
+Instead of storing separate factors per block, all blocks involving a given cluster
+share that cluster's **basis**:
 
 ```math
 K|_{\tau \times \sigma} \approx V_\tau \, S_{\tau\sigma} \, W_\sigma^\top
@@ -88,8 +88,8 @@ bases via small **transfer matrices**.  For a cluster ``\tau`` with children
 ``\tau_1, \tau_2``:
 
 ```math
-V_\tau = \begin{pmatrix} V_{\tau_1} \\ V_{\tau_2} \end{pmatrix}
-\begin{pmatrix} E_{\tau_1} & 0 \\ 0 & E_{\tau_2} \end{pmatrix}
+V_\tau = \begin{pmatrix} V_{\tau_1} & 0 \\ 0 & V_{\tau_2} \end{pmatrix}
+\begin{pmatrix} E_{\tau_1} \\ E_{\tau_2} \end{pmatrix}
 ```
 
 where ``E_{\tau_i} \in \mathbb{R}^{k_{\tau_i} \times k_\tau}`` are the transfer
@@ -165,8 +165,10 @@ For more general or less smooth kernels, we can build the basis adaptively:
 
 1. Assemble an H-matrix using **Adaptive Cross Approximation** (ACA), which
    finds per-block low-rank factors ``A_b B_b^\top`` with adaptive ranks.
-2. Collect all the ``A`` columns for each row cluster and compute an SVD to find
-   a shared basis that captures the column space of all blocks at that cluster.
+2. Weight row factors by the partner QR factor, ``A R_B^\mathsf{T}``,
+   and collect direct plus restricted ancestor interactions. Use an SVD to
+   construct a shared basis that retains these directions. Column bases use
+   the analogous ``B R_A^\mathsf{T}`` factors.
 3. Build transfer matrices by projecting through children's bases.
 4. Compute coupling matrices by projecting the original low-rank data through
    the nested bases.
@@ -193,6 +195,10 @@ while controlling the error:
 This is the algorithm from Börm's *Efficient Numerical Methods for Non-local
 Operators*.
 
+See [how the accuracy and performance advances work](advances.md) for the
+implementation's inherited-interaction handling, stored adjoints, strict rank
+caps, implicit saturated bases and contiguous packet products.
+
 ## Complexity Summary
 
 | Operation          | H-matrix             | H²-matrix     |
@@ -202,7 +208,12 @@ Operators*.
 | Assembly (Cheb.)   | —                    | ``O(N k)``     |
 | Assembly (ACA→H²)  | ``O(N k \log N)``    | + ``O(N k)``   |
 
-where ``k`` is the typical block rank.
+These are schematic favorable-regime estimates, with controlled ranks,
+interaction counts and leaf sizes. Each coupling/transfer product costs
+``O(k_\tau k_\sigma)`` or ``O(k_{\mathrm{child}} k_{\mathrm{parent}})``;
+these quadratic rank terms and dense near-field work must be included in an
+actual cost model. Rank growth at tight tolerances can erase small-mesh storage
+advantages, as the [PLAG066 results](validation.md) demonstrate.
 
 ## References
 

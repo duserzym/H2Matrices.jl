@@ -9,7 +9,7 @@ Install the tagged Git release:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.2")
+Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.3")
 ```
 
 ## Basic Workflow

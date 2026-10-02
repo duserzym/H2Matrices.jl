@@ -4,6 +4,21 @@
 
 *Fast hierarchical matrix algebra with nested bases in Julia.*
 
+## Accuracy-preserving advances
+
+The recent implementation first corrected nested-basis conversion and stored
+adjoints, then improved retained memory and repeated-product throughput using
+implicit saturated bases, reusable scratch and contiguous interaction packets.
+On a real 6,028-boundary-node PLAG066 grain, the selected four-worker plan uses
+302.75 MB versus 337.78 MB for corrected H² and 378.59 MB for H, while retaining
+the original ACA/basis tolerances. Generated LEM/NEB states have maximum
+H-reference torque discrepancy 5.50e-11 T.
+
+Read [how the advances work](advances.md), follow the
+[practical accuracy/performance guide](accuracy_performance.md), or inspect the
+[validation protocol and downloadable results](validation.md). The measurements
+cover one grain and path; retained storage is not peak assembly memory.
+
 ## What is an H²-matrix?
 
 Many problems in physics and engineering lead to large dense matrices that arise
@@ -13,16 +28,17 @@ field in micromagnetics.  These matrices are often too large to store or multipl
 directly (``O(N^2)`` cost), yet they contain a great deal of structure that can
 be exploited.
 
-**H²-matrices** (hierarchical matrices with nested bases) compress such kernel
-matrices down to ``O(N)`` storage and ``O(N)`` matrix–vector product cost.
+**H²-matrices** (hierarchical matrices with nested bases) can reduce such kernel
+matrices to linear storage and matrix–vector product cost when ranks and
+interaction counts remain controlled.
 They do this by:
 
 1. Recursively partitioning the row and column index sets into a **cluster tree**.
 2. Approximating well-separated (far-field) blocks with a low-rank factorization
    ``A_{τσ} ≈ V_τ \, S_{τσ} \, W_σ^{\!\top}``.
 3. **Sharing** the basis matrices ``V_τ`` and ``W_σ`` across blocks — this is
-   what distinguishes H²-matrices from ordinary H-matrices and yields ``O(N)``
-   instead of ``O(N \log N)`` complexity.
+   what distinguishes H²-matrices from ordinary H-matrices and can yield linear
+   complexity when ranks and interaction counts remain controlled.
 
 ## Key Features
 
@@ -49,7 +65,7 @@ N = 1000
 src = [SVector{2,Float64}(rand(), rand()) for _ in 1:N]
 tgt = [SVector{2,Float64}(2.0 + rand(), rand()) for _ in 1:N]
 
-# Define a kernel (2D Laplace Green's function)
+# Define a 1/r potential kernel on planar point sets
 K = KernelMatrix(src, tgt) do x, y
     r = norm(x - y)
     r > 0 ? 1 / (4π * r) : 0.0
@@ -76,5 +92,6 @@ This package is designed for researchers and students in:
   kernels.
 - **Any field** where you need to multiply large dense kernel matrices fast.
 
-If you can write down your kernel function ``G(x, y)``, this package can compress
-and apply the resulting matrix in linear time.
+For compressible kernels with controlled ranks and interaction counts, nested
+bases can support linear storage and product complexity. Actual ranks, near-field
+storage and setup memory should be measured for the intended application.

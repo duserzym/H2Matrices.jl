@@ -17,7 +17,11 @@ makedocs(;
         "Getting Started" => "getting_started.md",
         "Examples"        => "examples.md",
         "API Reference"   => "api.md",
-        "Accuracy and Performance" => "accuracy_performance.md",
+        "Accuracy and Performance" => [
+            "Practical Guide" => "accuracy_performance.md",
+            "How the Advances Work" => "advances.md",
+            "PLAG066 Validation" => "validation.md",
+        ],
     ],
 )
 

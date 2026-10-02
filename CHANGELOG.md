@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3
+
+Documentation-only release: explain the causes of the accuracy fixes and the
+compact/packet advances, publish the PLAG066 protocol and downloadable evidence,
+and add a runnable rectangular reference example. Clarify rank-dependent scaling,
+retained versus peak memory, and the separate relaxed-tolerance tradeoff. Numerical
+source and defaults are unchanged.
+
 ## 0.1.2
 
 - Require Julia 1.13 or later and test the latest stable Julia release in CI.
