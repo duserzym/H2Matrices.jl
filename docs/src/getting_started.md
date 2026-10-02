@@ -2,13 +2,14 @@
 
 ## Installation
 
-H2Matrices.jl depends on [HMatrices.jl](https://github.com/WaveProp/HMatrices.jl)
-for cluster trees, kernel matrices, and ACA.  Install both with:
+Julia 1.13 or later is required. H2Matrices uses registered
+[HMatrices.jl](https://github.com/IntegralEquations/HMatrices.jl) for cluster
+trees, kernel matrices and ACA; Pkg resolves this dependency automatically.
+Install the tagged Git release:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/WaveProp/HMatrices.jl")
-Pkg.add(url="https://github.com/yimingzhang/H2Matrices.jl")
+Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.2")
 ```
 
 ## Basic Workflow

@@ -10,8 +10,7 @@ So far this package is completely vibed out with AI agents, by feeding the HMatr
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/IntegralEquations/HMatrices.jl")
-Pkg.add(url="https://github.com/duserzym/H2Matrices.jl")
+Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.2")
 ```
 
 ## Overview
@@ -226,7 +225,7 @@ For the unregistered package, install a reproducible release with:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.1")
+Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.2")
 ```
 
 ## Documentation
@@ -245,4 +244,4 @@ The current development plan is tracked in [ROADMAP.md](ROADMAP.md).
 - HMatrices.jl: https://github.com/IntegralEquations/HMatrices.jl
 - H2Lib: https://github.com/H2Lib/H2Lib
 
-Julia 1.8 or later is required; HMatrices 0.2.13 uses constant fields in mutable structs.
+Julia 1.13 or later is required. CI tracks the latest stable Julia release.

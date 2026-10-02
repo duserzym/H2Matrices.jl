@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+
+- Require Julia 1.13 or later and test the latest stable Julia release in CI.
+- Keep the validated numerical implementation and compression tolerances unchanged.
+
 ## 0.1.1
 
 - Correct adaptive nested basis construction: retain inherited interactions,
