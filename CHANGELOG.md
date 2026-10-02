@@ -14,8 +14,9 @@
   tolerances; optional low-rank coupling truncation is separately controlled.
 - Add threaded packet products with private adjoint reductions, safe overlapping
   near-field fallback, and cheap independent worker copies sharing numerical data.
-- Add regression and concurrency tests plus Julia 1.6/current CI. Require
-  HMatrices 0.2.13 or a later compatible 0.2 release.
+- Add regression and concurrency tests plus Julia 1.8/current CI. Require
+  HMatrices 0.2.13 or a later compatible 0.2 release. Julia 1.8 is the minimum
+  because this HMatrices release uses constant fields in mutable structs.
 
 A real PLAG066 campaign mesh validation at 570 °C retains ACA/basis tolerances
 1e-11/1e-10. Four-worker packet storage is 302.75 MB, versus 337.78 MB for H2
