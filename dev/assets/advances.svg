@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="620" viewBox="0 0 800 620" role="img" aria-labelledby="title desc">
+<title id="title">From correct nested compression to compact parallel products</title>
+<desc id="desc">Five steps preserve interactions, reuse scratch, replace saturated bases by implicit identities, pack products with safe threading, and verify physical results. Measurements are from PLAG066 with original tolerances.</desc>
+<rect width="800" height="620" fill="#f8fafc"/>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#64748b"/></marker></defs>
+<rect x="20" y="18" width="760" height="94" rx="10" fill="white" stroke="#cbd5e1"/>
+<rect x="20" y="18" width="7" height="94" rx="3" fill="#2563eb"/>
+<text x="42" y="45" font-family="Arial, sans-serif" font-size="19" font-weight="600" fill="#0f172a">1. Preserve the represented interactions</text>
+<text x="42" y="71" font-family="Arial, sans-serif" font-size="16" font-weight="400" fill="#334155">Inherited factors + partner QR weighting + stored adjoints</text>
+<text x="42" y="95" font-family="Arial, sans-serif" font-size="16" font-weight="500" fill="#0f766e">Restore conversion and energy-gradient consistency</text>
+<path d="M400,114 V125" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="20" y="130" width="760" height="94" rx="10" fill="white" stroke="#cbd5e1"/>
+<rect x="20" y="130" width="7" height="94" rx="3" fill="#2563eb"/>
+<text x="42" y="157" font-family="Arial, sans-serif" font-size="19" font-weight="600" fill="#0f172a">2. Reuse each application workspace</text>
+<text x="42" y="183" font-family="Arial, sans-serif" font-size="16" font-weight="400" fill="#334155">Cache traversal and permutations; allocate scratch once</text>
+<text x="42" y="207" font-family="Arial, sans-serif" font-size="16" font-weight="500" fill="#0f766e">Avoid repeated coefficient dictionaries and vectors</text>
+<path d="M400,226 V237" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="20" y="242" width="760" height="94" rx="10" fill="white" stroke="#cbd5e1"/>
+<rect x="20" y="242" width="7" height="94" rx="3" fill="#0f766e"/>
+<text x="42" y="269" font-family="Arial, sans-serif" font-size="19" font-weight="600" fill="#0f172a">3. Remove redundant saturated bases</text>
+<text x="42" y="295" font-family="Arial, sans-serif" font-size="16" font-weight="400" fill="#334155">Implicit identities; move basis action into couplings/transfers</text>
+<text x="42" y="319" font-family="Arial, sans-serif" font-size="16" font-weight="500" fill="#0f766e">337.78 → 302.75 MB at unchanged tolerances</text>
+<path d="M400,338 V349" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="20" y="354" width="760" height="94" rx="10" fill="white" stroke="#cbd5e1"/>
+<rect x="20" y="354" width="7" height="94" rx="3" fill="#0f766e"/>
+<text x="42" y="381" font-family="Arial, sans-serif" font-size="19" font-weight="600" fill="#0f172a">4. Pack and parallelize interactions</text>
+<text x="42" y="407" font-family="Arial, sans-serif" font-size="16" font-weight="400" fill="#334155">Contiguous GEMV packets; private adjoint reductions</text>
+<text x="42" y="431" font-family="Arial, sans-serif" font-size="16" font-weight="500" fill="#0f766e">7.79/6.92 → 3.36/2.61 ms forward/adjoint</text>
+<path d="M400,450 V461" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="20" y="466" width="760" height="94" rx="10" fill="white" stroke="#cbd5e1"/>
+<rect x="20" y="466" width="7" height="94" rx="3" fill="#0f766e"/>
+<text x="42" y="493" font-family="Arial, sans-serif" font-size="19" font-weight="600" fill="#0f172a">5. Check physical results against H</text>
+<text x="42" y="519" font-family="Arial, sans-serif" font-size="16" font-weight="400" fill="#334155">Common LEM/NEB inputs; maximum and RMS torque audits</text>
+<text x="42" y="543" font-family="Arial, sans-serif" font-size="16" font-weight="500" fill="#0f766e">Same iterations; generated-state torque error 5.5 × 10⁻¹¹ T</text>
+<text x="24" y="602" font-family="Arial,sans-serif" font-size="14" fill="#475569">PLAG066 · ACA 1e-11 / basis 1e-10 · four Julia workers / one BLAS thread</text></svg>
