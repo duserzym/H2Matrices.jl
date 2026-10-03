@@ -121,6 +121,39 @@ end
         @test _same_h2_data(h2, kept)
     end
 
+    @testset "Rank caps, loose tolerances and near-field-only matrices" begin
+        rng = MersenneTwister(935)
+        X = [Point3D(normalize(randn(rng, 3))...) for _ in 1:500]
+        K = KernelMatrix(X, X) do x, y
+            r = norm(x - y)
+            r > 0 ? 1 / r : 0.0
+        end
+        H = assemble_hmatrix(K, ClusterTree(copy(X), GeometricSplitter(; nmax=16)),
+            ClusterTree(copy(X), GeometricSplitter(; nmax=16)); comp=PartialACA(; rtol=1e-12),
+            global_index=true, threads=false)
+        for (rtol, maxrank) in ((1e-10, 12), (1e-4, 400), (0.0, 400))
+            ref = compress_hmatrix_to_h2(H; rtol, maxrank, _reference=true, _print=false)
+            new = maxrank == 12 ?
+                (@test_logs (:warn, r"rank cap") match_mode=:any compress_hmatrix_to_h2(H; rtol, maxrank, _print=false)) :
+                compress_hmatrix_to_h2(H; rtol, maxrank, _print=false)
+            @test _node_ranks(new) == _node_ranks(ref)
+            @test norm(Matrix(new) - Matrix(ref)) / norm(Matrix(ref)) < 1e-13
+        end
+        # rtol = 0 keeps every direction: identity bases reproduce H exactly.
+        @test Matrix(compress_hmatrix_to_h2(H; rtol=0.0, maxrank=400, _print=false)) == Matrix(H)
+        Y = X[1:10]
+        K2 = KernelMatrix(Y, Y) do x, y
+            r = norm(x - y)
+            r > 0 ? 1 / r : 0.0
+        end
+        H2 = assemble_hmatrix(K2, ClusterTree(copy(Y), GeometricSplitter(; nmax=32)),
+            ClusterTree(copy(Y), GeometricSplitter(; nmax=32)); global_index=true, threads=false)
+        h = compress_hmatrix_to_h2(deepcopy(H2); rtol=1e-10, maxrank=10, consume=true, _print=false)
+        @test Matrix(h) == Matrix(H2)
+        x = randn(rng, 10)
+        @test H2PacketMatvecPlan(h; workers=2, consume=true)*x ≈ Matrix(H2)*x
+    end
+
     @testset "Saturation certificate" begin
         rng = MersenneTwister(934)
         L = Matrix(UpperTriangular(randn(rng, 40, 40))) + 10I
