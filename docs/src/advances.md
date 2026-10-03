@@ -163,7 +163,9 @@ The selected tight-tolerance plan uses `coupling_rtol=nothing`. Reusable scratch
 
 `H2LowRankMatvecPlan`, optional compact-plan coupling SVD, relaxed basis tolerances and recompression can reduce storage further, but change the approximation. An earlier 244.40 MB candidate used basis tolerance `1e-7` and had screened torque discrepancy about `3.46e-7 T`. It passed that experiment's `1e-6 T` gate, but does not meet the later `1e-9 T` gate. The 303 MB result retains basis tolerance `1e-10`.
 
-The current packet constructor materializes factorized couplings when packing them. Combining SVD coupling compression with packets can therefore give up the factorized storage benefit, even though the stored approximation is retained.
+Packet plans built from a compact plan with factorized couplings keep the factors (`keep_factors=true`, the default): `L` joins the row packet and `R` is applied per segment, `R'*x` forward and `R*(L'*y)` in adjoint products, so the packet stores the compact plan's numbers and zero-rank couplings disappear. Each factored segment still owns its full slot range, so the race-free phases, the slot reductions and bitwise worker-count invariance are unchanged. `keep_factors=false` multiplies the factors out.
+
+Coupling truncation can be measured against each coupling's own norm or against one operator scale (`coupling_scale=:global` or a number), and `error_control=:global` does the same for ACA and the cluster bases. For this boundary operator the admissible block norms are nearly scale-invariant, so global and block-relative control select almost the same ranks; at equal accuracy the global variants saved 0-1% (up to 2.5% at relaxed accuracy), while the coupling truncation itself (with `eta=1.5`) saved 6-14% against the validated `eta=3` operator on PLAG066-PLAG022. See [Accuracy and performance](accuracy_performance.md#Global-(absolute)-error-control).
 
 ## Implementation and background
 

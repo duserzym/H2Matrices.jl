@@ -24,6 +24,9 @@ h2 = assemble_h2matrix_adaptive(K;
 | `threads=true` | Builds the intermediate H-matrix leaves on all Julia threads; the result equals the serial build (`K` must allow concurrent `getblock!`) | Any accuracy change |
 | `comp` | Replaces the default `PartialACA(; rtol=aca_rtol)` H-block compressor | Accuracy of the substitute compressor |
 | `conversion_threads` | Runs the H → H² conversion as Julia tasks (default with several Julia threads and one BLAS thread); bitwise independent of the thread count | Any accuracy change |
+| `error_control=:global` | Measures ACA and basis truncations against one operator scale `s` (absolute tolerances `aca_rtol*s` and `rtol*s`) instead of each block's or cluster's own norm | That weak blocks need less relative accuracy in a given application |
+| `atol`, `aca_atol`, `safeguard_rtol` | Explicit absolute basis and ACA thresholds, and a relative floor for the basis threshold | A global error bound |
+| `coupling_scale` | Reference of the optional coupling truncation: the coupling's own norm (`:block`), the largest stored block norm (`:global`) or a given scale | The original stored operator's accuracy without new checks |
 
 Kernel evaluation usually dominates the H-matrix build. A kernel type can
 specialize `HMatrices.getblock!` for `HMatrices.PermutedMatrix{<:MyKernel}`
@@ -126,6 +129,74 @@ recompress!(h2; rtol=1e-9, maxrank=512, strict=true)
 ```
 
 A rejected strict rank cap leaves `h2` unchanged. The temporary copy increases setup memory. Conversion and recompression traverse active children even when their parent has rank zero.
+
+### Global (absolute) error control
+
+By default every truncation is relative to what it acts on: ACA stops when the
+last update is small relative to the block's estimated norm, a cluster basis
+discards singular values below `rtol` times its own largest one, and
+`coupling_rtol` is relative to each coupling's norm. Global control measures
+them against one operator scale instead, so a block whose norm is far below
+the operator's is not resolved to the same relative accuracy as the strongest
+blocks:
+
+```julia
+s = estimate_operator_scale(K, rowtree, coltree)  # RMS row norm from 32 sampled rows
+h2 = assemble_h2matrix_adaptive(K, rowtree, coltree;
+    error_control=:global, scale=s,                # ACA atol = aca_rtol*s, basis atol = rtol*s
+    rtol=5e-11, aca_rtol=1e-11, maxrank=2048, strict=true,
+    adm=HMatrices.StrongAdmissibilityStd(1.5))
+compact = H2CompactMatvecPlan(h2; coupling_rtol=3e-11, coupling_scale=s)
+plan = H2PacketMatvecPlan(compact; workers=4)     # keeps the factored couplings
+```
+
+`compress_hmatrix_to_h2(H; rtol, atol, safeguard_rtol)` exposes the basis rule
+directly: keep singular values above `max(rtol*σ₁, min(atol, safeguard_rtol*σ₁))`.
+`atol=0` is the default block-relative rule, `rtol=0` is purely absolute, and a
+finite `safeguard_rtol` keeps every cluster resolved to at least that relative
+level if the scale is too large. These options change the approximation and
+need the same validation as any tolerance change.
+
+Global control pays off when block norms span many orders of magnitude. For the
+double-layer boundary operator of the micromagnetic campaign it does not: the
+Frobenius norm of an admissible block of a 1/r² kernel on a surface is roughly
+independent of the block's level and size, so admissible block norms stay
+within about two decades (0.005-0.6 on PLAG066, against an RMS row norm of
+0.62 on PLAG066 and PLAG036), and block-relative and absolute thresholds select
+nearly the same ranks. Measured at equal accuracy (forward and adjoint product
+errors against exact dense products no larger than the validated baseline's):
+
+- ACA: an absolute tolerance shrank the intermediate H-matrix by up to about
+  4.5% (PLAG066 378 → 361 MB, PLAG022 2027 → 1948 MB); the final operator's
+  storage did not change.
+- Bases: absolute truncation selected nearly the same ranks as relative
+  truncation (PLAG066: 30921 against 31030 basis vectors, with a larger
+  error). On PLAG036 it matched relative truncation at the same error and
+  needed 2-3% more storage at relaxed accuracy.
+- Couplings: truncation itself is the useful step. With `eta=1.5`, one
+  setting per variant on all grains (`rtol=1e-10`, `aca_rtol=1e-11`, packet
+  plans):
+
+  | Coupling truncation | PLAG066 | PLAG036 | PLAG022 |
+  |---|---|---|---|
+  | none, `eta=3` (validated baseline) | 302.8 MB, 1.85e-11 | 714.8 MB, 7.7e-11 | 1511 MB, 5.9e-11 |
+  | `coupling_rtol=1e-10` (`:block`) | 274.8 MB, 1.36e-11 | 668.9 MB, 6.2e-11 | 1309 MB, 5.6e-11 |
+  | `coupling_rtol=2e-11, coupling_scale=:global` | 272.3 MB, 1.63e-11 | 668.6 MB, 6.2e-11 | 1303 MB, 5.5e-11 |
+
+  (largest of the forward and adjoint relative errors). A global scale saved
+  0-1% over block-relative truncation at equal accuracy, and 1-2.5% at relaxed
+  accuracy (1e-10 to 1e-8) on PLAG066.
+
+What global control does change is how the error scales with the grain. With
+block-relative tolerances (`rtol=1e-10`, `coupling_rtol=1e-10`) the product
+error grew from 1.4e-11 (PLAG066) to 6.2e-11 (PLAG036) and 5.6e-11
+(PLAG022), consistent with each cluster's reference norm σ₁ growing with the
+number of blocks in its (inherited) block row. With
+`error_control=:global` (`rtol=5e-11`, `aca_rtol=1e-11`) and
+`coupling_rtol=3e-11, coupling_scale=s` it stayed at 1.5e-11, 1.9e-11 and
+2.4e-11 on PLAG066, PLAG036 and PLAG022 (271.9, 703.3 and 1345 MB), so one
+setting holds an accuracy target across grain sizes; at that tighter accuracy
+block-relative control needed the same storage (PLAG036: 703.7 MB at 1.8e-11).
 
 ## Validate before enlarging a campaign
 

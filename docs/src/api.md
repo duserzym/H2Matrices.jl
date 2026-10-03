@@ -11,6 +11,7 @@ assemble_h2matrix_adaptive
 
 ```@docs
 compress_hmatrix_to_h2
+estimate_operator_scale
 recompress!
 compress_matrix_to_h2
 ```
