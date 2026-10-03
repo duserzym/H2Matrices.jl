@@ -1,33 +1,32 @@
-@testset "Interleaved row storage and kernels" begin
+@testset "Reduced-precision row blocks and kernels" begin
     rng=MersenneTwister(77)
-    for rows in 0:9, T in (Float64,Float32,H2Matrices._T48)
-        A=randn(rng,rows,13).*exp10.(rand(rng,-8:2,rows,13));S=H2Matrices._InterleavedRows{T}(A)
-        D=Float64.(Matrix(S))
-        if T===H2Matrices._T48
+    for rows in 0:9, T in (Float64,Float32,H2Matrices._Matrix48)
+        A=randn(rng,rows,13).*exp10.(rand(rng,-8:2,rows,13))
+        S=T===H2Matrices._Matrix48 ? H2Matrices._Matrix48(undef,rows,15) : Matrix{T}(undef,rows,15)
+        e=H2Matrices._store_block!(S,A,2)
+        D=Float64.(S[:,3:15])
+        @test e ≈ sum(abs2,D-A) rtol=1e-12 atol=0
+        if T===H2Matrices._Matrix48
             @test all(abs.(D.-A) .<= H2Matrices._U48 .* abs.(A))
             @test D!=A || rows==0
+            @test H2Matrices._nbytes(S)==6*rows*15
         else
-            @test Matrix(S)==T.(A)
+            @test D==T.(A)
         end
-        x=randn(rng,15);z=randn(rng,rows+2);z0=copy(z)
-        H2Matrices._il_forward!(z,1,S,x,2)
-        @test z ≈ z0+[0;D*x[3:15];0] rtol=1e-14 atol=1e-14
-        w=randn(rng,rows+3);y=randn(rng,14);y0=copy(y)
-        H2Matrices._il_adjoint!(y,1,S,w,2)
+        # The packet kernels read every format and accumulate in Float64.
+        S[:,1:2].=0;D=Float64.(S)
+        x=randn(rng,17);z=randn(rng,rows+2);z0=copy(z)
+        H2Matrices._kernel_n!(z,1,S,0,15,x,2)
+        @test z ≈ z0+[0;D*x[3:17];0] rtol=1e-14 atol=1e-14
+        w=randn(rng,rows+3);y=randn(rng,16);y0=copy(y)
+        H2Matrices._kernel_t!(y,1,S,0,15,w,2)
         @test y ≈ y0+[0;D'*w[3:rows+2]] rtol=1e-14 atol=1e-14
-        # Several right-hand sides (strided blocks, every register-block width).
-        for K in (1,2,3,5,9)
-            X=randn(rng,2+13K);Z=randn(rng,1+(rows+1)K);Z0=copy(Z)
-            H2Matrices._il_forward_k!(Z,1,rows+1,S,X,2,13,K)
-            for v in 1:K
-                @test Z[1+(v-1)*(rows+1)+1:1+(v-1)*(rows+1)+rows] ≈ Z0[1+(v-1)*(rows+1)+1:1+(v-1)*(rows+1)+rows]+D*X[2+(v-1)*13+1:2+v*13] rtol=1e-14 atol=1e-14
-            end
-            W=randn(rng,3+(rows+2)K);Y=randn(rng,1+14K);Y0=copy(Y)
-            H2Matrices._il_adjoint_k!(Y,1,14,S,W,3,rows+2,K)
-            for v in 1:K
-                @test Y[1+(v-1)*14+1:1+(v-1)*14+13] ≈ Y0[1+(v-1)*14+1:1+(v-1)*14+13]+D'*W[3+(v-1)*(rows+2)+1:3+(v-1)*(rows+2)+rows] rtol=1e-14 atol=1e-14
-            end
-        end
+        K=5;X=randn(rng,15K);Z=zeros(rows*K)
+        H2Matrices._kernel_nk!(Z,0,rows,S,0,15,X,0,15,K)
+        @test reshape(Z,rows,K) ≈ D*reshape(X,15,K) rtol=1e-14 atol=1e-14
+        W=randn(rng,rows*K);Y=zeros(15K)
+        H2Matrices._kernel_tk!(Y,0,15,S,0,15,W,0,rows,K)
+        @test reshape(Y,15,K) ≈ D'*reshape(W,rows,K) rtol=1e-14 atol=1e-14
     end
     # Householder rotations: forward and transposed application are inverse transposes.
     k=11;r=6;U=Matrix(qr(randn(rng,k,k)).Q)
@@ -73,7 +72,9 @@ end
             # Rigorous: ‖(Ã-A)x‖ ≤ bound‖x‖, plus Float64 roundoff of both products.
             @test norm(P*x-M*x) <= s.bound*norm(x)+1e-13*opnorm(M)*norm(x)
             @test norm(adjoint(P)*z-M'*z) <= s.bound*norm(z)+1e-13*opnorm(M)*norm(z)
-            rtol==0 && @test P*x ≈ P0*x rtol=1e-13
+            # Without reduced rows the plan is the packet plan, bitwise.
+            rtol==0 && @test P*x==P0*x && adjoint(P)*z==adjoint(P0)*z
+            rtol==0 && (Xm=randn(rng,size(M,2),9);Zm=randn(rng,size(M,1),9);@test P*Xm==P0*Xm && adjoint(P)*Zm==adjoint(P0)*Zm)
             for (A,input) in ((P,x),(transpose(P),z),(adjoint(P),z))
                 expected=A*input
                 y=randn(rng,length(expected));old=copy(y)
@@ -115,7 +116,7 @@ end
     # A large budget stores every packet in Float32 without rotations.
     Pall=H2MixedPacketMatvecPlan(compact;precision_rtol=1e-3);sall=precision_summary(Pall)
     @test sall.float32_rows==sall.rows && sall.rotated_packets==0 && sall.rotation_bytes==0
-    @test sum(b->length(b.lo.data),Pall.engine.packets)==sum(b->length(b.S),compact.couplings)
+    @test sum(b->length(b.lo),Pall.engine.packets)==sum(b->length(b.S),compact.couplings)
     # Unaligned, overlapping near-field rows.
     D=fill(0.03,20,10)
     dense=vcat(compact.dense,[H2Matrices._PlanDense(D,3:22,1:10)])
@@ -185,7 +186,7 @@ end
     # Construction is bitwise deterministic under threads: the absorbed
     # left (own packet) and right (parent packet) factors are applied in a
     # fixed order whatever the schedule.
-    stored(P)=(io=IOBuffer();foreach(b->write(io,b.hi.data,b.lo.data,b.mid.data.hi,b.hv),P.engine.packets);
+    stored(P)=(io=IOBuffer();foreach(b->write(io,b.hi,b.lo,b.mid.hi,b.mid.lo,b.hv),P.engine.packets);
         foreach(n->write(io,n.E,n.V),P.engine.rows);take!(io))
     ref=stored(H2MixedPacketMatvecPlan(compact;precision_rtol=1e-10,format48=true))
     @test all(stored(H2MixedPacketMatvecPlan(compact;precision_rtol=1e-10,format48=true,workers=w))==ref for w in (1,2,4,1,2,4))

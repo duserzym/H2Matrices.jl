@@ -8,257 +8,79 @@
 # u32*omega_i in the Frobenius norm, so precision follows singular-value
 # weight; the leading rows stay Float64.
 #
-# Rows of one packet are stored in an interleaved layout (groups of four rows,
-# column-interleaved), so each packet is one sequential memory stream. The
-# kernels read it with SIMD and accumulate in Float64. The packets run on the
-# task engine of H2PacketMatvecPlan (phases, write ownership, slot reductions,
-# near-field column packets), so products are deterministic and bitwise
-# independent of the worker count.
+# The packets run on the task engine of H2PacketMatvecPlan (phases, write
+# ownership, slot reductions, near-field column packets) and every row block
+# is stored column-major and read by the engine's fused kernels, which widen
+# reduced-precision entries on load. Products are deterministic and bitwise
+# independent of the worker count; without reduced rows they equal the packet
+# plan's bitwise.
 
 const _U32 = Float64(eps(Float32)) / 2      # unit roundoff of Float32 rounding to nearest
 
 const _U48 = 2.0^-37                        # unit roundoff of the 48-bit format below
 
-# Optional 48-bit format: a Float64 truncated to sign, exponent and 36 mantissa
-# bits (round to nearest), stored as a UInt32 plane and a UInt16 plane.
-struct _T48 end
-struct _Planes48
+# Optional 48-bit format: a Float64 rounded to sign, exponent and 36 mantissa
+# bits (round to nearest), stored column-major as a UInt32 plane and a UInt16
+# plane. Linear indexing decodes an entry, so the packet kernels read it directly.
+struct _Matrix48 <: AbstractMatrix{Float64}
     hi::Vector{UInt32}
     lo::Vector{UInt16}
+    m::Int
+    n::Int
 end
-_storage(::Type{T}, n) where {T<:Union{Float32,Float64}} = Vector{T}(undef, n)
-_storage(::Type{_T48}, n) = _Planes48(Vector{UInt32}(undef, n), Vector{UInt16}(undef, n))
-Base.@propagate_inbounds _put!(d::Vector{T}, q, v) where {T} = (d[q] = T(v); nothing)
-Base.@propagate_inbounds function _put!(d::_Planes48, q, v)
+_Matrix48(::UndefInitializer, m::Int, n::Int) = _Matrix48(Vector{UInt32}(undef, m * n), Vector{UInt16}(undef, m * n), m, n)
+Base.size(A::_Matrix48) = (A.m, A.n)
+Base.IndexStyle(::Type{_Matrix48}) = IndexLinear()
+Base.@propagate_inbounds Base.getindex(A::_Matrix48, q::Int) =
+    reinterpret(Float64, (UInt64(A.hi[q]) << 32) | (UInt64(A.lo[q]) << 16))
+Base.@propagate_inbounds function Base.setindex!(A::_Matrix48, v, q::Int)
     u = (reinterpret(UInt64, Float64(v)) + 0x0000_0000_0000_8000) & 0xffff_ffff_ffff_0000
-    d.hi[q] = UInt32(u >> 32); d.lo[q] = UInt16((u >> 16) & 0xffff)
-    nothing
+    A.hi[q] = UInt32(u >> 32); A.lo[q] = UInt16((u >> 16) & 0xffff)
+    v
 end
-Base.@propagate_inbounds _ld(d::Vector{T}, q) where {T} = Float64(d[q])
-Base.@propagate_inbounds _ld(d::_Planes48, q) = reinterpret(Float64, (UInt64(d.hi[q]) << 32) | (UInt64(d.lo[q]) << 16))
-_nbytes(d::Vector) = sizeof(d)
-_nbytes(d::_Planes48) = sizeof(d.hi) + sizeof(d.lo)
+_nbytes(A::Matrix) = sizeof(A)
+_nbytes(A::_Matrix48) = sizeof(A.hi) + sizeof(A.lo)
 # Largest packet Frobenius norm whose rows may be stored in each reduced format:
 # every stored entry is bounded by the norm (up to rotation roundoff), so the
 # factors keep rounding (and the 48-bit carry) away from overflow.
 const _MAX32 = Float64(floatmax(Float32)) / 2
 const _MAX48 = floatmax(Float64) / 4
-
-# Row-interleaved storage of a dense `rows x N` matrix: groups of four rows are
-# stored column-interleaved (`data[4N*g+4(j-1)+q] = A[4g+q,j]`), and the trailing
-# `rows % 4` rows follow, each contiguous.
-struct _InterleavedRows{T,D}
-    data::D
-    rows::Int
-    N::Int
-end
-const _Rows64 = _InterleavedRows{Float64,Vector{Float64}}
-const _Rows48 = _InterleavedRows{_T48,_Planes48}
-const _Rows32 = _InterleavedRows{Float32,Vector{Float32}}
-# Position of entry (i, j) in the interleaved storage of a `rows x N` matrix.
-@inline function _il_index(rows, N, i, j)
-    g4 = rows ÷ 4; g = (i - 1) >> 2
-    g < g4 ? 4N * g + 4(j - 1) + (i - 4g) : 4N * g4 + N * (i - 4g4 - 1) + j
-end
-_InterleavedRows{T}(::UndefInitializer, rows::Int, N::Int) where {T} =
-    (d = _storage(T, rows * N); _InterleavedRows{T,typeof(d)}(d, rows, N))
-# Store A (rows x n) into columns coloff+1:coloff+n.
-function _put_block!(S::_InterleavedRows, A::AbstractMatrix, coloff::Int)
-    rows, N, d = S.rows, S.N, S.data
-    @inbounds for j in axes(A, 2), i in 1:rows
-        _put!(d, _il_index(rows, N, i, coloff + j), A[i, j])
-    end
-    S
-end
-# Squared Frobenius norm of (stored - A) over columns coloff+1:coloff+n, without copies.
-function _rounding_err2(S::_InterleavedRows, A::AbstractMatrix, coloff::Int=0)
-    rows, N, d = S.rows, S.N, S.data; e = 0.0
-    @inbounds for j in axes(A, 2), i in 1:rows
-        e += abs2(_ld(d, _il_index(rows, N, i, coloff + j)) - A[i, j])
+# Store A into columns off+1:off+size(A,2) of S (rounding to S's format) and
+# return the squared Frobenius norm of the rounding error, computed exactly
+# from the stored values.
+function _store_block!(S::AbstractMatrix, A::AbstractMatrix, off::Int)
+    e = 0.0
+    @inbounds for j in axes(A, 2), i in axes(A, 1)
+        S[i, off+j] = A[i, j]
+        e += abs2(Float64(S[i, off+j]) - A[i, j])
     end
     e
 end
-_InterleavedRows{T}(A::AbstractMatrix) where {T} = _put_block!(_InterleavedRows{T}(undef, size(A)...), A, 0)
-_eltype(::_InterleavedRows{T}) where {T} = T === _T48 ? Float64 : T
-function Base.Matrix(S::_InterleavedRows)
-    M = Matrix{_eltype(S)}(undef, S.rows, S.N)
-    for j in 1:S.N, i in 1:S.rows
-        M[i, j] = _ld(S.data, _il_index(S.rows, S.N, i, j))
-    end
-    M
-end
-@inline function _il_fwd4!(z, zo, d, o, N, x, xo)
-    s1 = 0.0; s2 = 0.0; s3 = 0.0; s4 = 0.0
-    @inbounds @simd for j in 1:N
-        xj = x[xo+j]; q = o + 4(j - 1)
-        s1 = muladd(_ld(d, q+1), xj, s1); s2 = muladd(_ld(d, q+2), xj, s2)
-        s3 = muladd(_ld(d, q+3), xj, s3); s4 = muladd(_ld(d, q+4), xj, s4)
-    end
-    @inbounds begin
-        z[zo+1] += s1; z[zo+2] += s2; z[zo+3] += s3; z[zo+4] += s4
-    end
-    nothing
-end
-@inline function _il_fwd1!(z, zo, d, o, N, x, xo)
-    s = 0.0
-    @inbounds @simd for j in 1:N
-        s = muladd(_ld(d, o+j), x[xo+j], s)
-    end
-    @inbounds z[zo+1] += s
-    nothing
-end
-# z[zo+i] += sum_j A[i,j] * x[xo+j]
-function _il_forward!(z::Vector{Float64}, zo::Int, A::_InterleavedRows, x::Vector{Float64}, xo::Int=0)
-    N = A.N; g4 = A.rows ÷ 4; d = A.data
-    for g in 0:g4-1
-        _il_fwd4!(z, zo + 4g, d, 4N * g, N, x, xo)
-    end
-    for r in 1:A.rows%4
-        _il_fwd1!(z, zo + 4g4 + r - 1, d, 4N * g4 + N * (r - 1), N, x, xo)
-    end
-    nothing
-end
-@inline function _il_adj4!(x, xo, d, o, N, w, wo)
-    @inbounds w1 = w[wo+1]; @inbounds w2 = w[wo+2]; @inbounds w3 = w[wo+3]; @inbounds w4 = w[wo+4]
-    @inbounds @simd for j in 1:N
-        q = o + 4(j - 1)
-        x[xo+j] = muladd(_ld(d, q+4), w4, muladd(_ld(d, q+3), w3, muladd(_ld(d, q+2), w2, muladd(_ld(d, q+1), w1, x[xo+j]))))
-    end
-    nothing
-end
-@inline function _il_adj1!(x, xo, d, o, N, wi)
-    @inbounds @simd for j in 1:N
-        x[xo+j] = muladd(_ld(d, o+j), wi, x[xo+j])
-    end
-    nothing
-end
-# x[xo+j] += sum_i A[i,j] * w[wo+i]   (exact transpose of _il_forward! on the same stored data)
-function _il_adjoint!(x::Vector{Float64}, xo::Int, A::_InterleavedRows, w::Vector{Float64}, wo::Int)
-    N = A.N; g4 = A.rows ÷ 4; d = A.data
-    for g in 0:g4-1
-        _il_adj4!(x, xo, d, 4N * g, N, w, wo + 4g)
-    end
-    for r in 1:A.rows%4
-        @inbounds wi = w[wo+4g4+r]
-        _il_adj1!(x, xo, d, 4N * g4 + N * (r - 1), N, wi)
-    end
-    nothing
-end
 
-# Several right-hand sides: register blocks of R stored rows (4 or 1) × V vectors.
-# Z[zo+r+(v-1)lz] += Σ_j A[r,j] X[xo+j+(v-1)lx]
-@generated function _il_fwdk!(Z, zo, lz, d, o, N, X, xo, lx, ::Val{R}, ::Val{V}) where {R,V}
-    acc(r, v) = Symbol(:s_, r, :_, v)
-    init = [:($(acc(r, v)) = 0.0) for r in 1:R for v in 1:V]
-    loads = [:($(Symbol(:a_, r)) = _ld(d, q + $r)) for r in 1:R]
-    xs = [:($(Symbol(:x_, v)) = X[xo+j+$(v - 1)*lx]) for v in 1:V]
-    fm = [:($(acc(r, v)) = muladd($(Symbol(:a_, r)), $(Symbol(:x_, v)), $(acc(r, v)))) for r in 1:R for v in 1:V]
-    st = [:(Z[zo+$r+$(v - 1)*lz] += $(acc(r, v))) for r in 1:R for v in 1:V]
-    quote
-        $(init...)
-        @inbounds @simd for j in 1:N
-            q = o + $R * (j - 1)
-            $(loads...)
-            $(xs...)
-            $(fm...)
-        end
-        @inbounds begin
-            $(st...)
-        end
-        nothing
-    end
-end
-# X[xo+j+(v-1)lx] += Σ_r A[r,j] W[wo+r+(v-1)lw]
-@generated function _il_adjk!(X, xo, lx, d, o, N, W, wo, lw, ::Val{R}, ::Val{V}) where {R,V}
-    wv(r, v) = Symbol(:w_, r, :_, v)
-    ws = [:($(wv(r, v)) = W[wo+$r+$(v - 1)*lw]) for r in 1:R for v in 1:V]
-    loads = [:($(Symbol(:a_, r)) = _ld(d, q + $r)) for r in 1:R]
-    body = Expr[]
-    for v in 1:V
-        idx = :(xo + j + $(v - 1) * lx); ex = :(X[$idx])
-        for r in 1:R
-            ex = :(muladd($(Symbol(:a_, r)), $(wv(r, v)), $ex))
-        end
-        push!(body, :(X[$idx] = $ex))
-    end
-    quote
-        @inbounds begin
-            $(ws...)
-        end
-        @inbounds @simd for j in 1:N
-            q = o + $R * (j - 1)
-            $(loads...)
-            $(body...)
-        end
-        nothing
-    end
-end
-@inline function _il_fwdk_call!(Z, zo, lz, d, o, N, X, xo, lx, r::Val, v)
-    v == 4 ? _il_fwdk!(Z, zo, lz, d, o, N, X, xo, lx, r, Val(4)) : v == 3 ? _il_fwdk!(Z, zo, lz, d, o, N, X, xo, lx, r, Val(3)) :
-    v == 2 ? _il_fwdk!(Z, zo, lz, d, o, N, X, xo, lx, r, Val(2)) : _il_fwdk!(Z, zo, lz, d, o, N, X, xo, lx, r, Val(1))
-end
-@inline function _il_adjk_call!(X, xo, lx, d, o, N, W, wo, lw, r::Val, v)
-    v == 4 ? _il_adjk!(X, xo, lx, d, o, N, W, wo, lw, r, Val(4)) : v == 3 ? _il_adjk!(X, xo, lx, d, o, N, W, wo, lw, r, Val(3)) :
-    v == 2 ? _il_adjk!(X, xo, lx, d, o, N, W, wo, lw, r, Val(2)) : _il_adjk!(X, xo, lx, d, o, N, W, wo, lw, r, Val(1))
-end
-# Z[zo+i+(v-1)lz] += Σ_j A[i,j] X[xo+j+(v-1)lx] for v=1:K. Each four-row group
-# is streamed once per register block of vectors, while it is still cached.
-function _il_forward_k!(Z::Vector{Float64}, zo::Int, lz::Int, A::_InterleavedRows, X::Vector{Float64}, xo::Int, lx::Int, K::Int)
-    N = A.N; g4 = A.rows ÷ 4; d = A.data
-    for g in 0:g4-1
-        v = 0
-        while v < K
-            c = _vblock(K - v); _il_fwdk_call!(Z, zo + 4g + v * lz, lz, d, 4N * g, N, X, xo + v * lx, lx, Val(4), c); v += c
-        end
-    end
-    for r in 1:A.rows%4
-        v = 0
-        while v < K
-            c = _vblock(K - v); _il_fwdk_call!(Z, zo + 4g4 + r - 1 + v * lz, lz, d, 4N * g4 + N * (r - 1), N, X, xo + v * lx, lx, Val(1), c); v += c
-        end
-    end
-    nothing
-end
-# X[xo+j+(v-1)lx] += Σ_i A[i,j] W[wo+i+(v-1)lw] for v=1:K.
-function _il_adjoint_k!(X::Vector{Float64}, xo::Int, lx::Int, A::_InterleavedRows, W::Vector{Float64}, wo::Int, lw::Int, K::Int)
-    N = A.N; g4 = A.rows ÷ 4; d = A.data
-    for g in 0:g4-1
-        v = 0
-        while v < K
-            c = _vblock(K - v); _il_adjk_call!(X, xo + v * lx, lx, d, 4N * g, N, W, wo + 4g + v * lw, lw, Val(4), c); v += c
-        end
-    end
-    for r in 1:A.rows%4
-        v = 0
-        while v < K
-            c = _vblock(K - v); _il_adjk_call!(X, xo + v * lx, lx, d, 4N * g4 + N * (r - 1), N, W, wo + 4g4 + r - 1 + v * lw, lw, Val(1), c); v += c
-        end
-    end
-    nothing
-end
-
-# Coupling packet of the mixed plan: rows 1:hi.rows in Float64, then 48-bit,
-# then Float32 rows, all over the packet's N columns (colcoeff segments
-# `columns`, adjoint slots `slot+1:slot+N`).
+# Coupling packet of the mixed plan: rows 1:size(hi,1) in Float64, then
+# 48-bit, then Float32 rows, all over the packet's N columns (colcoeff segments
+# `columns`, adjoint slots `slot+1:slot+N`), each block column-major as in
+# `_CouplingPacket` (which it equals bitwise without reduced rows).
 struct _MixedCouplingPacket
     row::UnitRange{Int}
     columns::Vector{UnitRange{Int}}
     slot::Int
-    hi::_Rows64
-    mid::_Rows48
-    lo::_Rows32
+    hi::Matrix{Float64}
+    mid::_Matrix48
+    lo::Matrix{Float32}
     # Explicit packet rotation Q = H_1 ⋯ H_r as Householder reflectors (empty if
     # none or absorbed into the row basis): reflector i is [1; hv[off_i+1:off_i+k-i]].
     hv::Vector{Float64}
     tau::Vector{Float64}
 end
-_packet_ncols(b::_MixedCouplingPacket) = b.hi.N
-_packet_bytes(b::_MixedCouplingPacket) = _nbytes(b.hi.data) + _nbytes(b.mid.data) + _nbytes(b.lo.data) + sizeof(b.hv) + sizeof(b.tau)
-# Time model for task ordering: Float32 elements stream about 1.4x faster than Float64 ones.
-_packet_work(b::_MixedCouplingPacket) =
-    b.hi.rows * b.hi.N + 1.35 * b.mid.rows * b.mid.N + 0.7 * b.lo.rows * b.lo.N + 4.0 * length(b.hv) + 2.0 * b.hi.N
-# Per-worker scratch (per right-hand side): gathered input and rotated rows.
-_packet_scratch(b::_MixedCouplingPacket) = b.hi.N + (isempty(b.tau) ? 0 : length(b.row))
+_packet_ncols(b::_MixedCouplingPacket) = size(b.hi, 2)
+_packet_bytes(b::_MixedCouplingPacket) = sizeof(b.hi) + _nbytes(b.mid) + sizeof(b.lo) + sizeof(b.hv) + sizeof(b.tau)
+# Time model for task ordering (equals the packet plan's without reduced rows):
+# Float32 elements stream about 1.4x faster than Float64 ones.
+_packet_work(b::_MixedCouplingPacket) = length(b.mid) + length(b.lo) + length(b.tau) == 0 ? Float64(length(b.hi)) :
+    length(b.hi) + 0.8 * length(b.mid) + 0.7 * length(b.lo) + 4.0 * length(b.hv)
+# Per-worker scratch (per right-hand side): rotated rows.
+_packet_scratch(b::_MixedCouplingPacket) = isempty(b.tau) ? 0 : length(b.row)
 # Stored Float64 entries of r Householder reflectors of a k-row rotation.
 _reflector_entries(k, r) = r * k - (r * (r + 1)) ÷ 2
 @inline function _reflect!(z, zo, hv, off, i, k, τ)
@@ -292,10 +114,28 @@ end
 _apply_reflectors!(z::Vector{Float64}, hv::Vector{Float64}, tau::Vector{Float64}, transposed::Bool) =
     _apply_reflectors!(z, 0, length(z), hv, tau, transposed)
 
+# y[y0+1:y0+m] += M * x[columns] (M: one row block of a packet; empty blocks skipped).
+function _segments_n!(y, y0, M::AbstractMatrix, columns, x)
+    size(M, 1) == 0 && return nothing
+    off = 0
+    for cr in columns
+        _kernel_n!(y, y0, M, off, length(cr), x, first(cr) - 1); off += length(cr)
+    end
+    nothing
+end
+function _segments_nk!(Y, y0, ly, M::AbstractMatrix, columns, X, lx, K)
+    size(M, 1) == 0 && return nothing
+    off = 0
+    for cr in columns
+        _kernel_nk!(Y, y0, ly, M, off, length(cr), X, first(cr) - 1, lx, K); off += length(cr)
+    end
+    nothing
+end
 # Forward: rowcoeff[row] += Q W colcoeff[columns]; adjoint: slot = Wᵀ Qᵀ rowcoeff[row].
+# Without a stored rotation these are exactly the `_CouplingPacket` operations.
 function _coupling_task!(p, b::_MixedCouplingPacket, w, t)
-    s = p.scratch[w]; N = b.hi.N; k = length(b.row); r0 = first(b.row) - 1
-    o2 = b.hi.rows; o3 = o2 + b.mid.rows
+    s = p.scratch[w]; N = size(b.hi, 2); k = length(b.row); r0 = first(b.row) - 1
+    o2 = size(b.hi, 1); o3 = o2 + size(b.mid, 1)
     if t
         sl = p.slots; s0 = b.slot
         @inbounds for j in 1:N; sl[s0+j] = 0.0; end
@@ -306,37 +146,31 @@ function _coupling_task!(p, b::_MixedCouplingPacket, w, t)
             _apply_reflectors!(s, 0, k, b.hv, b.tau, true)
             src = s; wo = 0
         end
-        _il_adjoint!(sl, s0, b.hi, src, wo)
-        _il_adjoint!(sl, s0, b.mid, src, wo + o2)
-        _il_adjoint!(sl, s0, b.lo, src, wo + o3)
+        size(b.hi, 1) > 0 && _kernel_t!(sl, s0, b.hi, 0, N, src, wo)
+        size(b.mid, 1) > 0 && _kernel_t!(sl, s0, b.mid, 0, N, src, wo + o2)
+        size(b.lo, 1) > 0 && _kernel_t!(sl, s0, b.lo, 0, N, src, wo + o3)
     else
-        off = 0; x = p.colcoeff
-        @inbounds for cr in b.columns
-            c0 = first(cr) - 1
-            for i in 1:length(cr); s[off+i] = x[c0+i]; end
-            off += length(cr)
-        end
         if isempty(b.tau)
             z = p.rowcoeff; zo = r0
         else
-            z = s; zo = N
-            @inbounds for i in 1:k; s[N+i] = 0.0; end
+            z = s; zo = 0
+            @inbounds for i in 1:k; s[i] = 0.0; end
         end
-        _il_forward!(z, zo, b.hi, s, 0)
-        _il_forward!(z, zo + o2, b.mid, s, 0)
-        _il_forward!(z, zo + o3, b.lo, s, 0)
+        _segments_n!(z, zo, b.hi, b.columns, p.colcoeff)
+        _segments_n!(z, zo + o2, b.mid, b.columns, p.colcoeff)
+        _segments_n!(z, zo + o3, b.lo, b.columns, p.colcoeff)
         if !isempty(b.tau)
-            _apply_reflectors!(s, N, k, b.hv, b.tau, false)
+            _apply_reflectors!(s, 0, k, b.hv, b.tau, false)
             y = p.rowcoeff
-            @inbounds for i in 1:k; y[r0+i] += s[N+i]; end
+            @inbounds for i in 1:k; y[r0+i] += s[i]; end
         end
     end
     nothing
 end
 function _coupling_task_k!(p, ws, b::_MixedCouplingPacket, w, t, K)
     lrc = length(p.rowcoeff); lcc = length(p.colcoeff); ls = length(p.slots)
-    s = ws.scratch[w]; N = b.hi.N; k = length(b.row); r0 = first(b.row) - 1
-    o2 = b.hi.rows; o3 = o2 + b.mid.rows
+    s = ws.scratch[w]; N = size(b.hi, 2); k = length(b.row); r0 = first(b.row) - 1
+    o2 = size(b.hi, 1); o3 = o2 + size(b.mid, 1)
     if t
         sl = ws.slots; s0 = b.slot
         @inbounds for v in 0:K-1, j in 1:N; sl[s0+j+v*ls] = 0.0; end
@@ -349,33 +183,24 @@ function _coupling_task_k!(p, ws, b::_MixedCouplingPacket, w, t, K)
             end
             src = s; wo = 0; lw = k
         end
-        _il_adjoint_k!(sl, s0, ls, b.hi, src, wo, lw, K)
-        _il_adjoint_k!(sl, s0, ls, b.mid, src, wo + o2, lw, K)
-        _il_adjoint_k!(sl, s0, ls, b.lo, src, wo + o3, lw, K)
+        size(b.hi, 1) > 0 && _kernel_tk!(sl, s0, ls, b.hi, 0, N, src, wo, lw, K)
+        size(b.mid, 1) > 0 && _kernel_tk!(sl, s0, ls, b.mid, 0, N, src, wo + o2, lw, K)
+        size(b.lo, 1) > 0 && _kernel_tk!(sl, s0, ls, b.lo, 0, N, src, wo + o3, lw, K)
     else
-        x = ws.colcoeff
-        for v in 0:K-1
-            off = v * N
-            @inbounds for cr in b.columns
-                c0 = first(cr) - 1 + v * lcc
-                for i in 1:length(cr); s[off+i] = x[c0+i]; end
-                off += length(cr)
-            end
-        end
         if isempty(b.tau)
             z = ws.rowcoeff; zo = r0; lz = lrc
         else
-            z = s; zo = N * K; lz = k
-            @inbounds for i in 1:k*K; s[N*K+i] = 0.0; end
+            z = s; zo = 0; lz = k
+            @inbounds for i in 1:k*K; s[i] = 0.0; end
         end
-        _il_forward_k!(z, zo, lz, b.hi, s, 0, N, K)
-        _il_forward_k!(z, zo + o2, lz, b.mid, s, 0, N, K)
-        _il_forward_k!(z, zo + o3, lz, b.lo, s, 0, N, K)
+        _segments_nk!(z, zo, lz, b.hi, b.columns, ws.colcoeff, lcc, K)
+        _segments_nk!(z, zo + o2, lz, b.mid, b.columns, ws.colcoeff, lcc, K)
+        _segments_nk!(z, zo + o3, lz, b.lo, b.columns, ws.colcoeff, lcc, K)
         if !isempty(b.tau)
             y = ws.rowcoeff
             for v in 0:K-1
-                _apply_reflectors!(s, N * K + v * k, k, b.hv, b.tau, false)
-                @inbounds for i in 1:k; y[r0+i+v*lrc] += s[N*K+v*k+i]; end
+                _apply_reflectors!(s, v * k, k, b.hv, b.tau, false)
+                @inbounds for i in 1:k; y[r0+i+v*lrc] += s[v*k+i]; end
             end
         end
     end
@@ -397,8 +222,9 @@ scratch. Use BLAS threads=1 with `workers>1`.
 
 Each coupling packet `P` (`k × N`) is rotated to its left singular basis,
 `P = Q W`. Row `i` of `W` then has norm `ω_i = σ_i(P)`. Trailing rows with
-small weight are stored in Float32 and the leading rows in Float64, row-
-interleaved. Every product accumulates in Float64; Float32 values are only
+small weight are stored in Float32 and the leading rows in Float64, each row
+block column-major and read by the fused kernels of `H2PacketMatvecPlan`,
+which widen reduced-precision entries on load. Every product accumulates in Float64; Float32 values are only
 widened, never used as accumulators. Rotations of explicit (unsaturated) row
 bases are absorbed into copies of the transfers and leaf bases, so they cost
 no storage. For implicit (saturated) or physical rows, `Q` is stored as the
@@ -409,8 +235,8 @@ depends only on these subspaces, not on the basis chosen inside them.
 With `format48=true`, rows of intermediate weight can also use a 48-bit format:
 a Float64 rounded to 36 mantissa bits (unit roundoff `u₄₈ = 2⁻³⁷`), stored as
 a UInt32 plane plus a UInt16 plane. This lowers storage further, but its
-decode makes those rows slower to stream than Float64 rows on CPUs where a
-few workers already saturate memory bandwidth.
+decode costs time, so products are usually slower than with Float32/Float64
+rows only.
 
 A global Lagrangian allocation picks the rows. It minimizes stored bytes
 subject to the a priori bound
@@ -435,9 +261,8 @@ perturbation of products: `E‖(Ã-A)x‖² / E‖Ax‖² ≤ precision_rtol²`;
 per-vector guarantee. A packet is eligible for Float32 (48-bit) rows only if
 its Frobenius norm is below `floatmax(Float32)/2` (`floatmax(Float64)/4`), so
 reduced-precision rows cannot overflow; an operator whose `η` is not finite is
-stored entirely in Float64. `precision_rtol=0` keeps everything in Float64 and
-differs from `H2PacketMatvecPlan` only by the summation order of the
-interleaved coupling kernels. Near-field blocks always stay in Float64 (their
+stored entirely in Float64. `precision_rtol=0` keeps everything in Float64;
+its products are then bitwise identical to `H2PacketMatvecPlan`. Near-field blocks always stay in Float64 (their
 spectra are flat, so rotating them saves almost nothing).
 
 Forward and adjoint products apply the same stored values, so
@@ -634,8 +459,7 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
                 hv = reduce(vcat, [A[i+1:k, i] for i in 1:nref]; init=Float64[])
             end
         end
-        hirows = _InterleavedRows{Float64}(undef, r1, N)
-        midrows = _InterleavedRows{_T48}(undef, rm - r1, N); lorows = _InterleavedRows{Float32}(undef, k - rm, N)
+        hirows = Matrix{Float64}(undef, r1, N); midrows = _Matrix48(undef, rm - r1, N); lorows = Matrix{Float32}(undef, k - rm, N)
         off = 0; c = 0.0; e = 0.0; released = 0
         wbuf = rotated[t] ? Matrix{Float64}(undef, k, maximum(B -> size(B, 2), blocks)) : zeros(0, 0)
         for B in blocks
@@ -647,9 +471,9 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
                 LAPACK.ormqr!('L', 'T', A, tau, copyto!(view(wbuf, :, 1:size(B, 2)), B))   # Qᵀ B, Q never formed
             end
             hiW = view(Wb, 1:r1, :); midW = view(Wb, r1+1:rm, :); loW = view(Wb, rm+1:k, :)
-            _put_block!(hirows, hiW, off); _put_block!(midrows, midW, off); _put_block!(lorows, loW, off)
+            copyto!(view(hirows, :, off+1:off+size(B, 2)), hiW)
             c += _U32^2 * sum(abs2, loW) + length(loW) * 2.0^-300 + _U48^2 * sum(abs2, midW)
-            e += _rounding_err2(lorows, loW, off) + _rounding_err2(midrows, midW, off)
+            e += _store_block!(lorows, loW, off) + _store_block!(midrows, midW, off)
             off += size(B, 2); released += sizeof(B)
         end
         # The eligibility guard makes this unreachable; never store Inf silently.
@@ -673,7 +497,7 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
         float32_ineligible_packets=count(!, allow32),
         float64_far_bytes=sum((8 * ks[t] * Ns[t] for t in 1:nf); init=0),
         far_bytes=sel(_packet_bytes), near_bytes=sum((sizeof(b.matrix) for b in engine.nearpackets); init=0),
-        float32_bytes=sel(b -> _nbytes(b.lo.data)), float48_bytes=sel(b -> _nbytes(b.mid.data)),
+        float32_bytes=sel(b -> sizeof(b.lo)), float48_bytes=sel(b -> _nbytes(b.mid)),
         rotation_bytes=sel(b -> sizeof(b.hv) + sizeof(b.tau)))
     H2MixedPacketMatvecPlan(engine, precision)
 end
