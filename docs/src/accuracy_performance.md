@@ -21,6 +21,14 @@ h2 = assemble_h2matrix_adaptive(K;
 | `strict=true` | Reject a cap that violates a requested local threshold | Mesh, path or whole-campaign convergence |
 | `coupling_rtol` | Additional local coupling SVD truncation when requested | The original stored operator's accuracy without new checks |
 | `nmax`, admissibility | Tree/block partitioning and resulting ranks/work | A mesh-independent best configuration |
+| `threads=true` | Builds the intermediate H-matrix leaves on all Julia threads; the result equals the serial build (`K` must allow concurrent `getblock!`) | Any accuracy change |
+| `comp` | Replaces the default `PartialACA(; rtol=aca_rtol)` H-block compressor | Accuracy of the substitute compressor |
+
+Kernel evaluation usually dominates the H-matrix build. A kernel type can
+specialize `HMatrices.getblock!` for `HMatrices.PermutedMatrix{<:MyKernel}`
+columns, for `adjoint` rows and for `UnitRange × UnitRange` dense blocks.
+`assemble_hmatrix(...; global_index=true)` reaches the kernel only through
+those calls, and a specialized kernel can share work between entries.
 
 These are the validated PLAG066 parameters, not universal defaults. Tightening `rtol` cannot repair an insufficient rank cap, incomplete basis construction, or an energy-gradient inconsistency. Near-field blocks remain dense.
 
