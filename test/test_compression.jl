@@ -22,6 +22,37 @@
         @test norm(Matrix(h2) - dense) / norm(dense) < 5e-6
     end
 
+    @testset "Threaded adaptive assembly and compressor override" begin
+        n = 260
+        K, rowtree, coltree = separated_laplace2d(n; seed=25)
+        x = randn(MersenneTwister(26), n)
+        serial = assemble_h2matrix_adaptive(K, rowtree, coltree; rtol=1e-7, maxrank=40)
+        threaded = assemble_h2matrix_adaptive(K, rowtree, coltree; rtol=1e-7, maxrank=40,
+                                              threads=true)
+        # Leaves are assembled independently, so threading changes nothing.
+        @test Matrix(threaded) == Matrix(serial)
+        @test threaded * x == serial * x
+
+        # An explicit compressor replaces the default PartialACA(rtol=aca_rtol).
+        calls = Threads.Atomic{Int}(0)
+        aca = PartialACA(; rtol=1e-8)
+        counting = (K, rtree, ctree, buf=nothing) -> (Threads.atomic_add!(calls, 1); aca(K, rtree, ctree, buf))
+        custom = assemble_h2matrix_adaptive(K, rowtree, coltree; rtol=1e-7, maxrank=40,
+                                            comp=counting, threads=true)
+        default = assemble_h2matrix_adaptive(K, rowtree, coltree; rtol=1e-7, maxrank=40,
+                                             aca_rtol=1e-8)
+        @test calls[] > 0
+        @test Matrix(custom) == Matrix(default)
+
+        # The AbstractKernelMatrix convenience method forwards both options.
+        auto_serial = assemble_h2matrix_adaptive(K; rtol=1e-7, maxrank=40, nmax=24)
+        auto_threaded = assemble_h2matrix_adaptive(K; rtol=1e-7, maxrank=40, nmax=24,
+                                                   threads=true)
+        @test Matrix(auto_threaded) == Matrix(auto_serial)
+        dense = dense_kernel_matrix(K, n)
+        @test norm(Matrix(auto_threaded) - dense) / norm(dense) < 1e-6
+    end
+
     @testset "In-place recompression" begin
         n = 180
         K, rowtree, coltree = separated_laplace2d(n; seed=24)

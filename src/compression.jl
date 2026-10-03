@@ -842,7 +842,8 @@ end
 
 """
     assemble_h2matrix_adaptive(K, rowtree, coltree;
-        rtol=1e-8, maxrank=50, aca_rtol=nothing, aca_kwargs...)
+        rtol=1e-8, maxrank=50, aca_rtol=nothing, threads=false, comp=nothing,
+        aca_kwargs...)
 
 Assemble an H²-matrix adaptively: first build an H-matrix using ACA,
 then convert to H² format with nested bases.
@@ -855,8 +856,16 @@ because the ranks adapt to the actual kernel smoothness.
 - `rowtree`, `coltree` : cluster trees
 - `rtol` : relative tolerance for H² basis truncation
 - `maxrank` : maximum rank per cluster
-- `aca_rtol` : tolerance for ACA (defaults to `rtol / 10`)
+- `aca_rtol` : tolerance for ACA (defaults to `rtol / 10`); ignored when
+  `comp` is given
 - `strict` : reject a basis rank cap that prevents the local tolerance
+- `threads` : assemble the H-matrix leaves on `Threads.nthreads()` tasks
+  (HMatrices' threaded assembly). Every leaf is computed independently with
+  its own compressor buffer, so the H-matrix (and therefore the H² result) is
+  identical to the serial build; `K` must support concurrent `getblock!`
+  calls. Defaults to `false` for backward compatibility.
+- `comp` : compressor for the admissible blocks, called as in
+  `HMatrices.assemble_hmatrix` (default `HMatrices.PartialACA(; rtol=aca_rtol)`)
 - `aca_kwargs...` : additional arguments for `assemble_hmatrix`
 """
 function assemble_h2matrix_adaptive(
@@ -869,15 +878,21 @@ function assemble_h2matrix_adaptive(
     adm=StrongAdmissibilityStd(3),
     global_index::Bool=true,
     strict::Bool=false,
+    threads::Bool=false,
+    comp=nothing,
     kwargs...
 ) where {N,T}
     # Step 1: Build H-matrix via ACA
-    ar = aca_rtol === nothing ? rtol / 10 : aca_rtol
+    compressor = if comp === nothing
+        HMatrices.PartialACA(; rtol=aca_rtol === nothing ? rtol / 10 : aca_rtol)
+    else
+        comp
+    end
     hmat = HMatrices.assemble_hmatrix(K, rowtree, coltree;
                                        adm=adm,
-                                       comp=HMatrices.PartialACA(; rtol=ar),
+                                       comp=compressor,
                                        global_index=global_index,
-                                       threads=false,
+                                       threads=threads,
                                        kwargs...)
 
     # Step 2: Convert to H²
