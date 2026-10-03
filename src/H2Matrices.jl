@@ -26,6 +26,7 @@ include("compression.jl")
 include("copying.jl")
 include("compact_plan.jl")
 include("packet_plan.jl")
+include("packet_multi.jl")
 include("solvers.jl")
 include("plotting.jl")
 
