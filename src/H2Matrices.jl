@@ -28,10 +28,13 @@ include("copying.jl")
 include("compact_plan.jl")
 include("packet_plan.jl")
 include("packet_multi.jl")
+include("mixed_plan.jl")
 include("solvers.jl")
 include("plotting.jl")
 
 export H2PacketMatvecPlan,
+    H2MixedPacketMatvecPlan,
+    precision_summary,
     H2CompactMatvecPlan,
     H2LowRankMatvecPlan,
     H2MatvecPlan,

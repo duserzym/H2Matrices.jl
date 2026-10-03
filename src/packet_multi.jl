@@ -216,33 +216,38 @@ function _part_adjoint_k!(slots,s0,ls,q::_PacketPart,rowcoeff,y0,lrc,Z,K)
     end
     nothing
 end
-function _interaction_task_k!(p,ws,k,w,t,K)
-    lrc=length(p.rowcoeff);lcc=length(p.colcoeff);lrb=length(p.rowbuffer);lcb=length(p.colbuffer);ls=length(p.slots)
-    if k>0
-        b=p.packets[k];M=b.matrix;y0=first(b.row)-1
-        if t
-            s=ws.slots
-            @inbounds for v in 0:K-1, j in 1:b.width;s[b.slot+j+v*ls]=0.;end
-            if b.plain
-                _kernel_tk!(s,b.slot,ls,M,0,size(M,2),ws.rowcoeff,y0,lrc,K)
-            else
-                Z=ws.scratch[w]
-                _part_adjoint_k!(s,b.slot,ls,b.f64,ws.rowcoeff,y0,lrc,Z,K)
-                _part_adjoint_k!(s,b.slot,ls,b.f32,ws.rowcoeff,y0,lrc,Z,K)
-                _part_adjoint_k!(s,b.slot,ls,b.f16,ws.rowcoeff,y0,lrc,Z,K)
-            end
-        elseif b.plain
-            offset=0
-            for cr in b.columns
-                _kernel_nk!(ws.rowcoeff,y0,lrc,M,offset,length(cr),ws.colcoeff,first(cr)-1,lcc,K)
-                offset+=length(cr)
-            end
+function _coupling_task_k!(p,ws,b::_CouplingPacket,w,t,K)
+    lrc=length(p.rowcoeff);lcc=length(p.colcoeff);ls=length(p.slots)
+    M=b.matrix;y0=first(b.row)-1
+    if t
+        s=ws.slots
+        @inbounds for v in 0:K-1, j in 1:b.width;s[b.slot+j+v*ls]=0.;end
+        if b.plain
+            _kernel_tk!(s,b.slot,ls,M,0,size(M,2),ws.rowcoeff,y0,lrc,K)
         else
             Z=ws.scratch[w]
-            _part_forward_k!(ws.rowcoeff,y0,lrc,b.f64,ws.colcoeff,lcc,Z,K)
-            _part_forward_k!(ws.rowcoeff,y0,lrc,b.f32,ws.colcoeff,lcc,Z,K)
-            _part_forward_k!(ws.rowcoeff,y0,lrc,b.f16,ws.colcoeff,lcc,Z,K)
+            _part_adjoint_k!(s,b.slot,ls,b.f64,ws.rowcoeff,y0,lrc,Z,K)
+            _part_adjoint_k!(s,b.slot,ls,b.f32,ws.rowcoeff,y0,lrc,Z,K)
+            _part_adjoint_k!(s,b.slot,ls,b.f16,ws.rowcoeff,y0,lrc,Z,K)
         end
+    elseif b.plain
+        offset=0
+        for cr in b.columns
+            _kernel_nk!(ws.rowcoeff,y0,lrc,M,offset,length(cr),ws.colcoeff,first(cr)-1,lcc,K)
+            offset+=length(cr)
+        end
+    else
+        Z=ws.scratch[w]
+        _part_forward_k!(ws.rowcoeff,y0,lrc,b.f64,ws.colcoeff,lcc,Z,K)
+        _part_forward_k!(ws.rowcoeff,y0,lrc,b.f32,ws.colcoeff,lcc,Z,K)
+        _part_forward_k!(ws.rowcoeff,y0,lrc,b.f16,ws.colcoeff,lcc,Z,K)
+    end
+    nothing
+end
+function _interaction_task_k!(p,ws,k,w,t,K)
+    lrb=length(p.rowbuffer);lcb=length(p.colbuffer);ls=length(p.slots)
+    if k>0
+        _coupling_task_k!(p,ws,p.packets[k],w,t,K)
     else
         b=p.nearpackets[-k];M=b.matrix
         if t

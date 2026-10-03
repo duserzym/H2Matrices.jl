@@ -126,11 +126,11 @@ coupling once factorized), bounding peak construction memory by roughly one
 operator plus one packet. The source `h2` is unusable afterwards (its leaves
 hold no numerical blocks); the plan is bitwise identical to `consume=false`.
 """
-struct H2PacketMatvecPlan <: AbstractMatrix{Float64}
+struct H2PacketMatvecPlan{C} <: AbstractMatrix{Float64}
     shape::Tuple{Int,Int}
     rows::Vector{_CompactBasisNode}
     cols::Vector{_CompactBasisNode}
-    packets::Vector{_CouplingPacket}
+    packets::Vector{C}
     nearpackets::Vector{_NearPacket}
     tasks::Vector{Int}
     neartasks::Vector{Int}
@@ -208,18 +208,24 @@ function _tree_schedule(nodes,order,spans,refs::Vector{Vector{_SlotRef}},extra::
     end
     _TreeSchedule(order,jobs[sortperm(costs;rev=true)],flat)
 end
-function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,keep_factors::Bool=true,_release::Bool=false)
-    workers>0 || throw(ArgumentError("workers must be positive"))
-    tracker=_release ? _ReleaseTracker(storage_bytes(p)) : nothing
+# Couplings grouped by row node (in first-appearance order); couplings with an
+# empty side are dropped (and released with `release`).
+function _coupling_groups(p::H2CompactMatvecPlan,release::Bool)
     groups=Dict{Int,Vector{Int}}();order=Int[]
     for (i,b) in enumerate(p.couplings)
         if isempty(p.rows[b.row].coeff) || isempty(p.cols[b.col].coeff)
-            _release && (p.couplings[i]=_released_coupling(b))
+            release && (p.couplings[i]=_released_coupling(b))
         else
             haskey(groups,b.row) || (groups[b.row]=Int[];push!(order,b.row))
             push!(groups[b.row],i)
         end
     end
+    groups,order
+end
+function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,keep_factors::Bool=true,_release::Bool=false)
+    workers>0 || throw(ArgumentError("workers must be positive"))
+    tracker=_release ? _ReleaseTracker(storage_bytes(p)) : nothing
+    groups,order=_coupling_groups(p,_release)
     packets=_CouplingPacket[];slot=0
     for row in order
         packet=_build_coupling_packet(p,groups[row],p.rows[row].coeff,slot,keep_factors)
@@ -230,7 +236,20 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,keep_factors::
         isempty(packet.columns) && continue
         push!(packets,packet);slot+=packet.width
     end
-    rowslots=slot
+    _packet_engine(p,p.rows,packets,workers,_release,tracker)
+end
+# Coupling-packet interface of the engine: `_packet_work` (task-ordering cost),
+# `_packet_ncols` (adjoint slots), `_packet_bytes`, `_packet_scratch` (per-worker
+# scratch per right-hand side), `_coupling_task!` and `_coupling_task_k!`.
+_packet_work(b::_CouplingPacket)=_packet_flops(b)
+_packet_ncols(b::_CouplingPacket)=b.width
+_packet_scratch(b::_CouplingPacket)=_max_factor_rank(b)
+# Near-field packets, slot reductions and task schedules for the coupling
+# packets `packets` (slots assigned consecutively in packet order) of the
+# compact plan `p` with row basis nodes `rownodes` (same structure as `p.rows`).
+function _packet_engine(p::H2CompactMatvecPlan,rownodes::Vector{_CompactBasisNode},packets::Vector{C},workers::Int,
+                        _release::Bool,tracker) where {C}
+    rowslots=sum(_packet_ncols,packets;init=0)
     rorder,rspans=_tree_tops(p.rows);corder,cspans=_tree_tops(p.cols)
     # Near field: split dense blocks at elementary column intervals and stack
     # all pieces of one interval. Row segments are split at elementary row
@@ -296,11 +315,11 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,keep_factors::
     end
     none=[_SlotRef[] for _ in rspans];cnone=[_SlotRef[] for _ in cspans]
     # Near-field packets need no upward pass; they share the first phase with it.
-    tasks=sortperm([_packet_flops(b) for b in packets];rev=true)
+    tasks=sortperm([_packet_work(b) for b in packets];rev=true)
     neartasks=.-sortperm([length(b.matrix) for b in nearpackets];rev=true)
     # Worker scratch: gathered near-field rows (adjoint) or the inner vector
     # of a factored coupling segment.
-    maxrows=max(maximum((size(b.matrix,1) for b in nearpackets);init=0),maximum(_max_factor_rank,packets;init=0))
+    maxrows=max(maximum((size(b.matrix,1) for b in nearpackets);init=0),maximum(_packet_scratch,packets;init=0))
     rowdown=_tree_schedule(p.rows,rorder,rspans,rowrefs,extra)
     # Forward products start the downward pass of a row subtree as soon as its
     # last coupling packet completes. Subtrees with the costliest downward
@@ -312,9 +331,9 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,keep_factors::
     packetjob=[rownode[first(b.row)] for b in packets]
     jobdeps=zeros(Int,length(rowdown.jobs));foreach(k->jobdeps[k]+=1,packetjob)
     jobcost=[sum((length(p.rows[rowdown.order[t]].E) for t in job.nodes);init=0) for job in rowdown.jobs]
-    fwdtasks=sort(eachindex(packets);by=k->(-jobcost[packetjob[k]],packetjob[k],-_packet_flops(packets[k])))
+    fwdtasks=sort(eachindex(packets);by=k->(-jobcost[packetjob[k]],packetjob[k],-_packet_work(packets[k])))
     append!(fwdtasks,.-findall(iszero,jobdeps))
-    H2PacketMatvecPlan(p.shape,p.rows,p.cols,packets,nearpackets,tasks,neartasks,fwdtasks,packetjob,jobdeps,
+    H2PacketMatvecPlan(p.shape,rownodes,p.cols,packets,nearpackets,tasks,neartasks,fwdtasks,packetjob,jobdeps,
         _tree_schedule(p.rows,rorder,rspans,none,Vector{_SlotRef}[]),_tree_schedule(p.cols,corder,cspans,cnone,Vector{_SlotRef}[]),
         rowdown,_tree_schedule(p.cols,corder,cspans,colrefs,Vector{_SlotRef}[]),
         workers,zeros(length(p.rowcoeff)),zeros(length(p.colcoeff)),zeros(length(p.rowbuffer)),zeros(length(p.colbuffer)),
@@ -539,32 +558,37 @@ function _part_adjoint!(slots,s0,q::_PacketPart,rowcoeff,y0,z)
     end
     nothing
 end
-function _interaction_task!(p,k,w,t)
-    if k>0
-        b=p.packets[k];M=b.matrix;y0=first(b.row)-1
-        if t
-            s=p.slots;s0=b.slot
-            @inbounds for j in 1:b.width;s[s0+j]=0.;end
-            if b.plain
-                _kernel_t!(s,s0,M,0,size(M,2),p.rowcoeff,y0)
-            else
-                z=p.scratch[w]
-                _part_adjoint!(s,s0,b.f64,p.rowcoeff,y0,z)
-                _part_adjoint!(s,s0,b.f32,p.rowcoeff,y0,z)
-                _part_adjoint!(s,s0,b.f16,p.rowcoeff,y0,z)
-            end
-        elseif b.plain
-            offset=0
-            for cr in b.columns
-                _kernel_n!(p.rowcoeff,y0,M,offset,length(cr),p.colcoeff,first(cr)-1)
-                offset+=length(cr)
-            end
+# Coupling packet: forward rowcoeff[row] += P*colcoeff[columns]; adjoint slots = P'*rowcoeff[row].
+function _coupling_task!(p,b::_CouplingPacket,w,t)
+    M=b.matrix;y0=first(b.row)-1
+    if t
+        s=p.slots;s0=b.slot
+        @inbounds for j in 1:b.width;s[s0+j]=0.;end
+        if b.plain
+            _kernel_t!(s,s0,M,0,size(M,2),p.rowcoeff,y0)
         else
             z=p.scratch[w]
-            _part_forward!(p.rowcoeff,y0,b.f64,p.colcoeff,z)
-            _part_forward!(p.rowcoeff,y0,b.f32,p.colcoeff,z)
-            _part_forward!(p.rowcoeff,y0,b.f16,p.colcoeff,z)
+            _part_adjoint!(s,s0,b.f64,p.rowcoeff,y0,z)
+            _part_adjoint!(s,s0,b.f32,p.rowcoeff,y0,z)
+            _part_adjoint!(s,s0,b.f16,p.rowcoeff,y0,z)
         end
+    elseif b.plain
+        offset=0
+        for cr in b.columns
+            _kernel_n!(p.rowcoeff,y0,M,offset,length(cr),p.colcoeff,first(cr)-1)
+            offset+=length(cr)
+        end
+    else
+        z=p.scratch[w]
+        _part_forward!(p.rowcoeff,y0,b.f64,p.colcoeff,z)
+        _part_forward!(p.rowcoeff,y0,b.f32,p.colcoeff,z)
+        _part_forward!(p.rowcoeff,y0,b.f16,p.colcoeff,z)
+    end
+    nothing
+end
+function _interaction_task!(p,k,w,t)
+    if k>0
+        _coupling_task!(p,p.packets[k],w,t)
     else
         b=p.nearpackets[-k];M=b.matrix
         if t
@@ -642,7 +666,7 @@ function _packet_mul!(y,p::H2PacketMatvecPlan,x,alpha,beta,t)
     end
     y
 end
-const TransposedPacketH2Plan=Union{Transpose{Float64,H2PacketMatvecPlan},Adjoint{Float64,H2PacketMatvecPlan}}
+const TransposedPacketH2Plan=Union{Transpose{Float64,<:H2PacketMatvecPlan},Adjoint{Float64,<:H2PacketMatvecPlan}}
 LinearAlgebra.mul!(y::AbstractVector,p::H2PacketMatvecPlan,x::AbstractVector,alpha::Number=1,beta::Number=0)=_packet_mul!(y,p,x,alpha,beta,false)
 LinearAlgebra.mul!(y::AbstractVector,p::TransposedPacketH2Plan,x::AbstractVector,alpha::Number=1,beta::Number=0)=_packet_mul!(y,parent(p),x,alpha,beta,true)
 Base.:*(p::Union{H2PacketMatvecPlan,TransposedPacketH2Plan},x::AbstractVector)=mul!(zeros(size(p,1)),p,x)

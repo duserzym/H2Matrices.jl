@@ -19,6 +19,8 @@ include("support.jl")
     include("test_compact_plan.jl")
     include("test_packet_plan.jl")
     include("test_global_control.jl")
+    include("test_mixed_plan.jl")
+    include("test_composed_options.jl")
     include("test_h2lib_parity.jl")
     include("test_solvers.jl")
 end
