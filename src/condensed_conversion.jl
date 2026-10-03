@@ -47,8 +47,14 @@ end
 _basis_kind(k::_ConversionBases, cb) = k.kind[k.index[cb]]
 _full_identity(k::_ConversionBases, cb) = k.full[k.index[cb]]
 
-struct _BasisBuildContext{D,K}
-    data::D
+const _RkEntry = NamedTuple{(:A,:B),Tuple{Matrix{Float64},Matrix{Float64}}}
+const _NO_ENTRIES = _RkEntry[]
+
+struct _BasisBuildContext{K,F}
+    # Admissible factor pairs by node index (`kinds.index`): blocks whose row
+    # (for row bases) or column (for column bases) cluster is that node. Each
+    # task only touches its own node's slot, which is emptied once used.
+    data::Vector{Vector{_RkEntry}}
     rtol::Float64
     maxrank::Int
     is_row::Bool
@@ -56,6 +62,17 @@ struct _BasisBuildContext{D,K}
     lock::ReentrantLock
     kinds::K
     spawn_min::Int   # spawn child subtrees for clusters at least this large
+    fill::F          # `nothing` or an `_EagerFill` run as nodes become final
+end
+
+# Node-indexed factor lists from a Dict keyed by `objectid(cluster)`.
+function _node_entries(data::AbstractDict, root::ClusterBasis, kinds::_ConversionBases)
+    out = [_NO_ENTRIES for _ in 1:length(kinds.kind)]
+    for cb in nodes(root)
+        e = get(data, objectid(cb.cluster), nothing)
+        e === nothing || (out[kinds.index[cb]] = collect(_RkEntry, e))
+    end
+    return out
 end
 
 function _record_rank_cap!(ctx::_BasisBuildContext, S, k)
@@ -83,7 +100,12 @@ _local_rows(child, parent_range) =
 # computed in a per-cluster workspace; TRMM reads only its upper triangle.
 function _active_matrix_t(cb::ClusterBasis, ctx::_BasisBuildContext, inherited_t)
     m = length(cb)
-    entries = get(ctx.data, objectid(cb.cluster), nothing)
+    slot = ctx.kinds.index[cb]
+    entries = ctx.data[slot]
+    # Drop this cluster's factor references once its active set is formed, so
+    # consumed H blocks can be released as soon as their couplings exist.
+    ctx.data[slot] = _NO_ENTRIES
+    isempty(entries) && (entries = nothing)
     wd = 0; maxn = 0; maxr = 0
     if entries !== nothing
         for b in entries
@@ -335,7 +357,10 @@ end
 function _condensed_basis!(cb::ClusterBasis, inherited_t, ctx::_BasisBuildContext)
     Ct = _active_matrix_t(cb, ctx, inherited_t)
     inherited_t = nothing
-    isleaf(cb) && return _leaf_basis!(cb, Ct, ctx)
+    if isleaf(cb)
+        _leaf_basis!(cb, Ct, ctx)
+        return _node_ready!(ctx.fill, cb)
+    end
     Lt, triangular = Ct === nothing ? (nothing, false) : _condense_active_t!(Ct)
     irange = index_range(cb.cluster)
     # Children inherit column blocks of Lt (views; Lt stays alive until they
@@ -355,7 +380,8 @@ function _condensed_basis!(cb::ClusterBasis, inherited_t, ctx::_BasisBuildContex
             _condensed_basis!(child, sub(child), ctx)
         end
     end
-    return _transfer_basis!(cb, Lt, triangular, ctx)
+    _transfer_basis!(cb, Lt, triangular, ctx)
+    return _node_ready!(ctx.fill, cb)
 end
 
 function _materialize_identity_embeddings!(root::ClusterBasis, kinds::_ConversionBases)
@@ -374,27 +400,20 @@ function _condensed_spawn_min(threads::Bool)
 end
 
 """
-Collect admissible leaf block data without copying the ACA factors.
+Collect admissible leaf block data by row and column basis node, without
+copying the ACA factors.
 """
-function _collect_rk_data_shared(hmat::HMatrix)
-    row_data = Dict{UInt,Vector{NamedTuple{(:A,:B),Tuple{Matrix{Float64},Matrix{Float64}}}}}()
-    col_data = Dict{UInt,Vector{NamedTuple{(:A,:B),Tuple{Matrix{Float64},Matrix{Float64}}}}}()
-    function visit(h)
-        if HMatrices.isleaf(h)
-            if HMatrices.isadmissible(h)
-                d = HMatrices.data(h)
-                if d !== nothing
-                    entry = (A=_float_matrix(d.A), B=_float_matrix(d.B))
-                    push!(get!(row_data, objectid(HMatrices.rowtree(h)), valtype(row_data)()), entry)
-                    push!(get!(col_data, objectid(HMatrices.coltree(h)), valtype(col_data)()), entry)
-                end
-            end
-        else
-            foreach(visit, HMatrices.children(h))
-        end
+function _collect_rk_entries(pairs, kinds::_ConversionBases)
+    data = [_RkEntry[] for _ in 1:length(kinds.kind)]
+    for (h, hm) in pairs
+        HMatrices.isadmissible(hm) || continue
+        d = HMatrices.data(hm)
+        d === nothing && continue
+        entry = (A=_float_matrix(d.A), B=_float_matrix(d.B))
+        push!(data[kinds.index[h.row_basis]], entry)
+        push!(data[kinds.index[h.col_basis]], entry)
     end
-    visit(hmat)
-    return row_data, col_data
+    return data
 end
 
 function _leaf_pairs!(pairs, h2::H2Matrix, hmat::HMatrix)
@@ -461,43 +480,39 @@ function _fill_leaf!(h2::H2Matrix, hmat::HMatrix, kinds::_ConversionBases, consu
     return nothing
 end
 
-# Bytes a consuming fill adds (coupling) minus those it releases (factors).
-function _fill_net_bytes(h::H2Matrix, hm::HMatrix)
-    HMatrices.isadmissible(hm) || return 0
-    return 8 * h.row_basis.k * h.col_basis.k - _hblock_bytes(HMatrices.data(hm))
+# A coupling needs only the final bases of its row and column clusters, which
+# are final once each node's own transfer step is done. Each admissible block
+# is therefore filled (and, when consuming, its ACA factors released) by the
+# task that completes the second of its two nodes, overlapping the fill with
+# the remaining basis work. The result does not depend on the schedule.
+struct _EagerFill{P,K,T}
+    pairs::Vector{P}
+    lists::Vector{Vector{Int}}           # by node index: pairs of that node
+    pending::Vector{Threads.Atomic{Int}} # nodes still to finish per pair
+    kinds::K
+    consume::Bool
+    tracker::T
 end
 
-function _fill_h2_condensed!(h2::H2Matrix, hmat::HMatrix, kinds::_ConversionBases;
-                             threads::Bool, consume::Bool)
-    pairs = _leaf_pairs!(Tuple{typeof(h2),typeof(hmat)}[], h2, hmat)
-    tracker = consume ?
-        _ReleaseTracker(sum((_hblock_bytes(HMatrices.data(hm)) for (_, hm) in pairs); init=0)) : nothing
-    ntasks = threads ? min(Threads.nthreads(), length(pairs)) : 1
-    if ntasks <= 1
-        for (h, hm) in pairs
-            _fill_leaf!(h, hm, kinds, consume, tracker)
-        end
-    else
-        # Each block is independent, so the result does not depend on the order.
-        # Largest blocks first balances load; when consuming, blocks that free
-        # the most memory (ACA factors larger than the coupling) go first so the
-        # heap shrinks before it grows.
-        order = consume ? sortperm([_fill_net_bytes(h, hm) for (h, hm) in pairs]) :
-            sortperm([length(h.row_basis) * length(h.col_basis) for (h, _) in pairs]; rev=true)
-        next = Threads.Atomic{Int}(1)
-        tasks = map(1:ntasks) do _
-            Threads.@spawn begin
-                while true
-                    n = Threads.atomic_add!(next, 1)
-                    n > length(order) && break
-                    h, hm = pairs[order[n]]
-                    _fill_leaf!(h, hm, kinds, consume, tracker)
-                end
-            end
-        end
-        foreach(fetch, tasks)
+function _EagerFill(pairs::Vector{P}, kinds::_ConversionBases, consume::Bool, tracker) where {P}
+    lists = [Int[] for _ in 1:length(kinds.kind)]
+    for (p, (h, _)) in enumerate(pairs)
+        push!(lists[kinds.index[h.row_basis]], p)
+        push!(lists[kinds.index[h.col_basis]], p)
     end
-    return h2
+    pending = [Threads.Atomic{Int}(2) for _ in pairs]
+    return _EagerFill(pairs, lists, pending, kinds, consume, tracker)
+end
+
+_node_ready!(::Nothing, cb) = cb
+function _node_ready!(f::_EagerFill, cb::ClusterBasis)
+    for p in f.lists[f.kinds.index[cb]]
+        if Threads.atomic_sub!(f.pending[p], 1) == 1
+            h, hm = f.pairs[p]
+            _fill_leaf!(h, hm, f.kinds, f.consume, f.tracker)
+        end
+    end
+    return cb
 end
 
 function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict, threads, consume)
@@ -508,12 +523,18 @@ function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict,
     row_map = _build_obj_map(rb)
     col_map = _build_obj_map(cb)
     kinds = _ConversionBases(rb, cb)
-    row_data, col_data = _collect_rk_data_shared(hmat)
+    h2 = _mirror_hmat_to_h2(hmat, row_map, col_map)
+    pairs = _leaf_pairs!(Tuple{typeof(h2),typeof(hmat)}[], h2, hmat)
+    admissible = filter(p -> HMatrices.isadmissible(p[2]), pairs)
+    data = _collect_rk_entries(admissible, kinds)
+    tracker = consume ?
+        _ReleaseTracker(sum((_hblock_bytes(HMatrices.data(hm)) for (_, hm) in admissible); init=0)) : nothing
+    fill = _EagerFill(admissible, kinds, consume, tracker)
     capped = Float64[]
     lk = ReentrantLock()
     spawn_min = _condensed_spawn_min(threads)
-    rctx = _BasisBuildContext(row_data, rtol, maxrank, true, capped, lk, kinds, spawn_min)
-    cctx = _BasisBuildContext(col_data, rtol, maxrank, false, capped, lk, kinds, spawn_min)
+    rctx = _BasisBuildContext(data, rtol, maxrank, true, capped, lk, kinds, spawn_min, fill)
+    cctx = _BasisBuildContext(data, rtol, maxrank, false, capped, lk, kinds, spawn_min, fill)
     if threads
         # Row and column bases are independent.
         task = Threads.@spawn _condensed_basis!(cb, nothing, cctx)
@@ -523,15 +544,13 @@ function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict,
         _condensed_basis!(rb, nothing, rctx)
         _condensed_basis!(cb, nothing, cctx)
     end
-    # Bases are complete: drop the factor references so a consuming fill can
-    # release each ACA block as soon as its coupling is formed.
-    empty!(row_data); empty!(col_data)
     if !isempty(capped)
         message = "H2 basis rank cap prevents the requested local tolerance at $(length(capped)) clusters; largest relative discarded singular value = $(maximum(capped)). Increase maxrank."
         strict ? throw(ArgumentError(message)) : (@warn message)
     end
-    h2 = _mirror_hmat_to_h2(hmat, row_map, col_map)
-    _fill_h2_condensed!(h2, hmat, kinds; threads, consume)
+    for (h, hm) in pairs
+        HMatrices.isadmissible(hm) || _fill_leaf!(h, hm, kinds, consume, tracker)
+    end
     _materialize_identity_embeddings!(rb, kinds)
     _materialize_identity_embeddings!(cb, kinds)
     return h2

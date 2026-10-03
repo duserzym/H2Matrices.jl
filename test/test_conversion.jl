@@ -87,16 +87,21 @@ end
         ct = ClusterTree(copy(X), GeometricSplitter(; nmax=16))
         H = assemble_hmatrix(K, rt, ct; comp=PartialACA(; rtol=1e-11), global_index=true, threads=false)
         kept = compress_hmatrix_to_h2(H; rtol=1e-9, maxrank=300, strict=true, _print=false)
-        # A strict rank-cap failure is raised before any block is released.
+        # Without consumption a strict rank-cap failure leaves H usable for a retry;
+        # with consumption the failure is still reported (H is then unusable).
         Hs = deepcopy(H)
-        @test_throws ArgumentError compress_hmatrix_to_h2(Hs; rtol=1e-12, maxrank=1, strict=true,
-                                                          consume=true, _print=false)
+        @test_throws ArgumentError compress_hmatrix_to_h2(Hs; rtol=1e-12, maxrank=1, strict=true, _print=false)
         @test !_all_leaf_data_released(Hs)
         @test _same_h2_data(compress_hmatrix_to_h2(Hs; rtol=1e-9, maxrank=300, strict=true, _print=false), kept)
-        Hc = deepcopy(H)
-        used = compress_hmatrix_to_h2(Hc; rtol=1e-9, maxrank=300, strict=true, consume=true, _print=false)
-        @test _same_h2_data(used, kept)
-        @test _all_leaf_data_released(Hc)
+        @test_throws ArgumentError compress_hmatrix_to_h2(deepcopy(H); rtol=1e-12, maxrank=1, strict=true,
+                                                          consume=true, _print=false)
+        for threads in (false, true)
+            Hc = deepcopy(H)
+            used = compress_hmatrix_to_h2(Hc; rtol=1e-9, maxrank=300, strict=true, consume=true,
+                                          threads, _print=false)
+            @test _same_h2_data(used, kept)
+            @test _all_leaf_data_released(Hc)
+        end
 
         x = randn(rng, 600); z = randn(rng, 600)
         for workers in (1, 4)

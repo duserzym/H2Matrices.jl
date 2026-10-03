@@ -44,9 +44,11 @@ The algorithm:
 - `threads` : build row/column bases, independent subtrees and couplings with
   Julia tasks. Results are bitwise independent of the thread count. Defaults
   to true when Julia has several threads and BLAS uses one thread.
-- `consume` : release each H-matrix block once it has been converted (the
-  near-field blocks move into the H² matrix without copying). `hmat` must not
-  be used afterwards. A strict rank-cap failure is raised before any release.
+- `consume` : release each H-matrix block as soon as its coupling is formed,
+  during the basis construction (the near-field blocks move into the H² matrix
+  without copying). `hmat` must not be used afterwards, also when the
+  conversion throws (e.g. a strict rank-cap failure); use `consume=false` to
+  retry with another `maxrank` on the same H-matrix.
 
 Ancestor interactions are condensed exactly: only Gram matrices of the active
 sets determine the bases, so each cluster passes a factor of width at most its
@@ -317,8 +319,8 @@ function _build_adaptive_basis_recursive!(
     r = index_range(cb.cluster)
     seed = isempty(inherited) ? nothing :
         Matrix(transpose(reduce(hcat, [M[(first(r)-first(ar)+1):(last(r)-first(ar)+1), :] for (M, ar) in inherited])))
-    ctx = _BasisBuildContext(data, rtol, maxrank, is_row, capped_residuals, ReentrantLock(),
-                             kinds, _condensed_spawn_min(threads))
+    ctx = _BasisBuildContext(_node_entries(data, cb, kinds), rtol, maxrank, is_row, capped_residuals,
+                             ReentrantLock(), kinds, _condensed_spawn_min(threads), nothing)
     _condensed_basis!(cb, seed, ctx)
     return _materialize_identity_embeddings!(cb, kinds)
 end
