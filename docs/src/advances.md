@@ -127,7 +127,7 @@ that is, when this stores fewer numbers. Applying the same rule with `D=|t|` pla
 | PLAG036 (12,415 nodes) | 714.85 MB | 661.02 MB | 8.94/7.38 → 7.47/5.87 |
 | PLAG022 (17,875 nodes) | 1511.48 MB | 1400.01 MB | 18.86/15.58 → 14.74/12.38 |
 
-Products changed by at most `1e-15` relative to the original plan, and errors against exact dense products were unchanged. Timings are medians of interleaved runs in one process on a shared machine.
+Products changed by at most `1.4e-15` relative to the original plan, and errors against exact dense products were unchanged. Timings are medians of interleaved runs in one process on a shared machine.
 
 ## Pack interactions into larger contiguous products
 
