@@ -71,12 +71,14 @@ function build_operator(K)
     h2 = assemble_h2matrix_adaptive(K;
         rtol=1e-10, aca_rtol=1e-11,
         maxrank=512, nmax=32, strict=true)
-    return H2PacketMatvecPlan(h2; workers=4)
+    return H2PacketMatvecPlan(h2; workers=4, consume=true)
 end
 plan = build_operator(K)
 ```
 
-After returning, unused assembly objects can be reclaimed; reclamation is governed by Julia's garbage collector. Construction still needs the intermediate H matrix, basis/SVD workspaces and packet packing buffers. This API does not establish a smaller peak assembly RSS.
+`assemble_h2matrix_adaptive` releases its private intermediate H-matrix block by block during the conversion, and `consume=true` releases the raw H² blocks while they are packed, so the H-matrix, raw H² operator and packets are never all alive together. Both are exact (the plan is bitwise identical). Construction still needs the H-matrix itself, basis/SVD workspaces and one packet at a time; reclamation is governed by Julia's garbage collector, which the consuming builders prompt with a few cheap full collections. Use `consume=true` only when the source operator is no longer needed.
+
+The conversion condenses ancestor interactions exactly (Gram-preserving QR of each cluster's active set), stores untruncated bases as identities, and runs independent subtrees and couplings as Julia tasks when Julia has several threads and BLAS uses one (`threads=true`; results are bitwise independent of the thread count).
 
 `storage_bytes(plan)` counts numerical basis, transfer, coupling and near-field data, excluding scratch and metadata. `Base.summarysize(plan)` estimates retained Julia object size, including scratch/metadata; it is not process RSS and does not include unrelated FEM data or BLAS workspaces. Summing `summarysize` across copies can double-count shared matrices.
 

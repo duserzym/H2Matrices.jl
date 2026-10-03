@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- Faster, lower-memory H → H² conversion with the same operator up to rounding:
+  each cluster condenses its active set (direct partner-weighted factors plus
+  inherited ancestor factors) by an exact Gram-preserving QR, so widths stay at
+  most the cluster size instead of accumulating every ancestor block. Truncation
+  ranks are unchanged. The v0.1.3 builder remains available as
+  `compress_hmatrix_to_h2(...; _reference=true)` for validation.
+- Untruncated bases are stored as identity leaves or identity embeddings (an
+  exact change of coordinates); a rigorous triangular-inverse certificate skips
+  transfer SVDs at saturated parents; compact plans skip exact identity
+  expansions (bitwise identical couplings).
+- `compress_hmatrix_to_h2(...; threads)` builds row/column bases, independent
+  subtrees and couplings with Julia tasks (default when Julia has several
+  threads and BLAS uses one). Results are bitwise independent of the thread count.
+- Couplings are formed as soon as both of their cluster bases are final, while
+  the remaining (top-level) basis work continues, using otherwise idle threads.
+- `consume=true` releases each H-matrix block as soon as its coupling exists
+  (during the basis construction; the H-matrix is unusable afterwards, also if
+  the conversion throws) and `H2PacketMatvecPlan(h2; consume=true)` releases
+  raw H² blocks while packing. `assemble_h2matrix_adaptive` consumes its private
+  H-matrix and accepts `threads`.
+
 ## 0.1.3
 
 Documentation-only release: explain the causes of the accuracy fixes and the

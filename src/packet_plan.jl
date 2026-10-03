@@ -19,6 +19,11 @@ worker-order reduction. Use BLAS threads=1 when enabling packet workers.
 One plan is not safe for concurrent calls; `copy(plan)` shares numerical data
 and allocates independent scratch for an additional caller. Source data must
 remain unchanged while plans are used.
+
+`consume=true` (H2 input only) releases the source operator's coupling and
+near-field blocks as they are packed, bounding peak construction memory by
+roughly one operator plus one packet. The source `h2` is unusable afterwards
+(its leaves hold no numerical blocks); the plan is bitwise identical.
 """
 struct H2PacketMatvecPlan <: AbstractMatrix{Float64}
     shape::Tuple{Int,Int}
@@ -36,12 +41,31 @@ struct H2PacketMatvecPlan <: AbstractMatrix{Float64}
     partials::Vector{Vector{Float64}}
     nearpartials::Vector{Vector{Float64}}
 end
-H2PacketMatvecPlan(h::H2Matrix;workers::Int=1)=H2PacketMatvecPlan(H2CompactMatvecPlan(h);workers)
-function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1)
+function H2PacketMatvecPlan(h::H2Matrix;workers::Int=1,consume::Bool=false)
     workers>0 || throw(ArgumentError("workers must be positive"))
+    core=H2CompactMatvecPlan(h)
+    # The compact plan now references every numerical block it needs, so the
+    # source blocks can be dropped and each packed group released in turn.
+    consume && _release_h2_blocks!(h)
+    H2PacketMatvecPlan(core;workers,_release=consume)
+end
+const _RELEASED_BLOCK=zeros(Float64,0,0)
+function _release_h2_blocks!(h::H2Matrix)
+    if isleaf(h)
+        h.uniform=nothing;h.dense=nothing
+    else
+        foreach(_release_h2_blocks!,h.children)
+    end
+    h
+end
+function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,_release::Bool=false)
+    workers>0 || throw(ArgumentError("workers must be positive"))
+    tracker=_release ? _ReleaseTracker(storage_bytes(p)) : nothing
     groups=Dict{Int,Vector{Int}}();order=Int[]
     for (i,b) in enumerate(p.couplings)
-        isempty(p.rows[b.row].coeff) || isempty(p.cols[b.col].coeff) || begin
+        if isempty(p.rows[b.row].coeff) || isempty(p.cols[b.col].coeff)
+            _release && (p.couplings[i]=_released_coupling(b))
+        else
             haskey(groups,b.row) || (groups[b.row]=Int[];push!(order,b.row))
             push!(groups[b.row],i)
         end
@@ -56,6 +80,11 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1)
             push!(blocks,S)
         end
         matrix=hcat(blocks...)
+        if _release
+            empty!(blocks)
+            for i in groups[row];p.couplings[i]=_released_coupling(p.couplings[i]);end
+            _released!(tracker,sizeof(matrix))
+        end
         push!(packets,_CouplingPacket(matrix,p.rows[row].coeff,columns,zeros(size(matrix,2))))
     end
     neargroups=Dict{UnitRange{Int},Vector{Int}}();nearorder=UnitRange{Int}[]
@@ -67,7 +96,13 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1)
     for row in nearorder
         bs=p.dense[neargroups[row]]
         matrix=hcat((b.D for b in bs)...)
-        push!(nearpackets,_CouplingPacket(matrix,row,[b.cols for b in bs],zeros(size(matrix,2))))
+        if _release
+            for i in neargroups[row];b=p.dense[i];p.dense[i]=_PlanDense(_RELEASED_BLOCK,b.rows,b.cols);end
+            bs=nothing
+            _released!(tracker,sizeof(matrix))
+        end
+        cols=[p.dense[i].cols for i in neargroups[row]]
+        push!(nearpackets,_CouplingPacket(matrix,row,cols,zeros(size(matrix,2))))
     end
     sortedrows=sort(nearorder;by=first)
     near_parallel=all(last(sortedrows[i])<first(sortedrows[i+1]) for i in 1:length(sortedrows)-1)
@@ -75,6 +110,8 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1)
         zeros(length(p.rowcoeff)),zeros(length(p.colcoeff)),zeros(length(p.rowbuffer)),zeros(length(p.colbuffer)),
         p.rowperm,p.colperm,[zeros(length(p.colcoeff)) for _ in 1:workers],[zeros(length(p.colbuffer)) for _ in 1:workers])
 end
+_released_coupling(b::_PlanCoupling)=_PlanCoupling(_RELEASED_BLOCK,b.row,b.col)
+_released_coupling(b::_LowRankPlanCoupling)=_LowRankPlanCoupling(_RELEASED_BLOCK,nothing,Float64[],b.row,b.col)
 Base.size(p::H2PacketMatvecPlan)=p.shape
 function _packet_forward!(rowcoeff,b::_CouplingPacket,colcoeff)
     offset=0
