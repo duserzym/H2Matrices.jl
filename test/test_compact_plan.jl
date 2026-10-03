@@ -137,4 +137,48 @@ end
     @test storage_bytes(H2CompactMatvecPlan(C;coupling_rtol=1e-8,coupling_scale=:global))<=
         storage_bytes(H2CompactMatvecPlan(C;coupling_rtol=1e-8))
     @test_throws ArgumentError H2CompactMatvecPlan(C;coupling_rtol=1e-8,coupling_scale=:relative)
+    # Mixed precision: Float32 storage for small singular components, Float64 arithmetic.
+    @test_throws ArgumentError H2CompactMatvecPlan(C;coupling_precision=Float32)
+    @test_throws ArgumentError H2CompactMatvecPlan(C;coupling_rtol=1e-8,coupling_precision=Float16)
+    for pt in (false,true),scale in (:block,:global)
+        F64=H2CompactMatvecPlan(C;coupling_rtol=1e-9,coupling_scale=scale,passthrough=pt)
+        F32=H2CompactMatvecPlan(C;coupling_rtol=1e-9,coupling_scale=scale,passthrough=pt,coupling_precision=Float32)
+        @test any(b->!isempty(b.L32),F32.couplings)
+        @test any(b->b.R32!==nothing,F32.couplings) && any(b->b.R!==nothing && b.R32===nothing && !isempty(b.L32),F32.couplings)
+        @test storage_bytes(F32)<storage_bytes(F64)
+        @test norm(F32*x-M*x)/norm(M*x)<1e-7
+        @test norm(adjoint(F32)*z-M'*z)/norm(M'*z)<1e-7
+        # Both directions apply the same stored numbers in Float64 arithmetic.
+        @test dot(z,F32*x) ≈ dot(adjoint(F32)*z,x) rtol=1e-13
+        for workers in (1,4)
+            K32=H2PacketMatvecPlan(F32;workers)
+            @test storage_bytes(K32)==storage_bytes(F32)
+            @test any(b->!isempty(b.columns32),K32.packets)
+            for (B,input,ref) in ((K32,x,F32*x),(transpose(K32),z,transpose(F32)*z),(adjoint(K32),z,adjoint(F32)*z))
+                @test B*input ≈ ref rtol=1e-13
+                y=randn(rng,1200);old=copy(y)
+                mul!(y,B,input,1.7,-0.3)
+                @test y ≈ 1.7ref-0.3old rtol=1e-12
+            end
+            @test dot(z,K32*x) ≈ dot(adjoint(K32)*z,x) rtol=1e-13
+            Q=copy(K32)
+            @test all(b.matrix32===c.matrix32 && (isempty(b.scratch32) || b.scratch32!==c.scratch32) for (b,c) in zip(K32.packets,Q.packets))
+            @test Q*x ≈ K32*x rtol=1e-14
+        end
+        G=copy(F32);@test G*x ≈ F32*x rtol=1e-14
+        @test all(b.L32===c.L32 && (isempty(b.scratch) || b.scratch!==c.scratch) for (b,c) in zip(F32.couplings,G.couplings))
+        if VERSION>=v"1.10"
+            single=H2PacketMatvecPlan(F32)
+            @test allocations(single,x,zeros(1200))==0
+            @test allocations(adjoint(single),x,zeros(1200))==0
+            @test allocations(F32,x,zeros(1200))==0
+            @test allocations(adjoint(F32),x,zeros(1200))==0
+        end
+    end
+    # Mixed-precision kernels match Float64 products of the stored Float32 values.
+    A32=randn(rng,Float32,37,23);u=randn(rng,23);v=randn(rng,37)
+    @test H2Matrices._mixed_mul!(copy(v),A32,u) ≈ v+Float64.(A32)*u rtol=1e-14
+    @test H2Matrices._mixed_tmul!(zeros(23),A32,v,false) ≈ Float64.(A32)'*v rtol=1e-14
+    @test H2Matrices._mixed_tmul!(copy(u),A32,v,true) ≈ u+Float64.(A32)'*v rtol=1e-14
+    @test_throws DimensionMismatch H2Matrices._mixed_mul!(zeros(3),A32,u)
 end
