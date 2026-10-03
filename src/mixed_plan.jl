@@ -417,16 +417,33 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
     rotated = [count(>(0), (n64[t], r48[t], r32[t])) > 1 for t in 1:np]
     # Pass 2: rotated packets split into Float64, optional 48-bit and Float32 rows.
     packets = Vector{_MixedPacket}(undef, np)
-    lo2 = zeros(np); err2 = zeros(np); Uabs = Vector{Matrix{Float64}}(undef, np)
+    lo2 = zeros(np); err2 = zeros(np)
+    # Rotations of explicit (unsaturated) row bases are absorbed into the copied
+    # basis nodes as soon as their packet is built: node i gets E ← Uᵢᵀ E, V ← V Uᵢ,
+    # and its children E ← E Uᵢ. Left and right factors commute, so the order of
+    # packets does not matter; a lock serializes the node updates.
+    rows = copy(p.rows); absorbing = ReentrantLock(); nabsorbed = Threads.Atomic{Int}(0)
+    function absorb!(i, U)
+        lock(absorbing) do
+            n = rows[i]
+            E = isempty(n.E) ? n.E : U' * n.E
+            V = isempty(n.V) ? n.V : n.V * U
+            rows[i] = _CompactBasisNode(V, E, n.coeff, n.indices, n.children, n.identity)
+            for j in n.children
+                c = rows[j]
+                isempty(c.E) || (rows[j] = _CompactBasisNode(c.V, c.E * U, c.coeff, c.indices, c.children, c.identity))
+            end
+        end
+        Threads.atomic_add!(nabsorbed, 1)
+        nothing
+    end
     Threads.@threads :dynamic for t in 1:np
         blocks = packet_blocks(t); k = ks[t]; N = Ns[t]; r1 = n64[t]; rm = r1 + r48[t]
         nref = r32[t] > 0 ? rm : r1
         hv = Float64[]; tau = Float64[]; U = zeros(0, 0); A = view(U, :, 1:0)
         if rotated[t]
             U = reverse!(eigen!(gram(blocks, k); alg=LinearAlgebra.DivideAndConquer()).vectors; dims=2)
-            if !explicitU[t]
-                Uabs[t] = U
-            else
+            if explicitU[t]
                 # Householder QR of the leading singular vectors (in place): the
                 # spans of Q[:, 1:j] and U[:, 1:j] agree for every j <= nref.
                 A, tau = LAPACK.geqrf!(view(U, :, 1:nref))
@@ -454,30 +471,7 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
         lo2[t] = beta2[t] * c; err2[t] = beta2[t] * e
         packets[t] = _MixedPacket(outrows[t], columns[t], hirows, midrows, lorows,
             hv, tau, zeros(N), zeros(isempty(tau) ? 0 : k))
-    end
-    # Absorb rotations of explicit (unsaturated) row bases into transfers and leaf bases.
-    absorbed = Dict{Int,Matrix{Float64}}(order[t] => Uabs[t] for t in 1:nf if rotated[t] && !explicitU[t])
-    rows = copy(p.rows)
-    if !isempty(absorbed)
-        parent = zeros(Int, length(rows))
-        for (i, n) in enumerate(rows), j in n.children
-            parent[j] = i
-        end
-        for (i, n) in enumerate(p.rows)
-            own = get(absorbed, i, nothing)
-            par = parent[i] == 0 ? nothing : get(absorbed, parent[i], nothing)
-            (own === nothing && par === nothing) && continue
-            E = n.E
-            if !isempty(E)
-                own === nothing || (E = own' * E)
-                par === nothing || (E = E * par)
-            end
-            V = n.V
-            if own !== nothing && !isempty(V)
-                V = V * own
-            end
-            rows[i] = _CompactBasisNode(V, E, n.coeff, n.indices, n.children, n.identity)
-        end
+        rotated[t] && !explicitU[t] && absorb!(order[t], U)
     end
     # Balanced static schedule over far and near packets (time model: Float32
     # elements stream about 1.4x faster than Float64 elements).
@@ -489,7 +483,7 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
     precision = (; rtol=Float64(precision_rtol), reference_norm=eta,
         bound=sqrt(sum(lo2; init=0.0)), storage_perturbation=sqrt(sum(err2; init=0.0)),
         float32_rows=sum(r32; init=0), float48_rows=sum(r48; init=0), rows=sum(ks; init=0), rotated_packets=count(rotated), packets=np,
-        near_rotated_packets=count(view(rotated, nf+1:np)), near_float32_rows=sum(view(r32, nf+1:np); init=0), absorbed_rotations=length(absorbed),
+        near_rotated_packets=count(view(rotated, nf+1:np)), near_float32_rows=sum(view(r32, nf+1:np); init=0), absorbed_rotations=nabsorbed[],
         float64_far_bytes=sum((8 * ks[t] * Ns[t] for t in 1:nf); init=0),
         float64_near_bytes=sum((8 * ks[t] * Ns[t] for t in nf+1:np); init=0),
         far_bytes=sel(_packet_bytes, 1:nf), near_bytes=sel(_packet_bytes, nf+1:np),
