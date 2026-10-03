@@ -61,6 +61,8 @@ struct _BasisBuildContext{K,F}
     # task only touches its own node's slot, which is emptied once used.
     data::Vector{Vector{_RkEntry}}
     rtol::Float64
+    atol::Float64       # absolute (global) truncation threshold, 0 = block-relative only
+    safeguard::Float64  # keep singular values above safeguard*S[1] whatever atol is
     maxrank::Int
     is_row::Bool
     capped::Vector{Float64}
@@ -81,8 +83,10 @@ function _node_entries(data::AbstractDict, root::ClusterBasis, kinds::_Conversio
     return out
 end
 
+_context_rank(ctx::_BasisBuildContext, S) = _truncation_rank(S, ctx.rtol, ctx.maxrank, ctx.atol, ctx.safeguard)
+
 function _record_rank_cap!(ctx::_BasisBuildContext, S, k)
-    if k == ctx.maxrank && k < length(S) && S[k+1] > ctx.rtol * S[1]
+    if k == ctx.maxrank && k < length(S) && S[k+1] > _truncation_threshold(S[1], ctx.rtol, ctx.atol, ctx.safeguard)
         lock(ctx.lock) do
             push!(ctx.capped, S[k+1] / S[1])
         end
@@ -176,7 +180,7 @@ function _leaf_basis!(cb::ClusterBasis, Ct, ctx::_BasisBuildContext)
     end
     # Left singular vectors of C_t are the right singular vectors of Ct.
     F = svd!(Ct)
-    k = _truncation_rank(F.S, ctx.rtol, ctx.maxrank)
+    k = _context_rank(ctx, F.S)
     _record_rank_cap!(ctx, F.S, k)
     if k == m
         cb.V = Matrix{Float64}(I, m, m)
@@ -272,7 +276,7 @@ end
 # direction under truncation: s_min >= 1/||R⁻¹||_F and s_max <= ||R||_F. The
 # margin keeps the decision far from the threshold, so it agrees with the
 # SVD-based decision of the reference builder (exact up to rounding).
-function _certified_full_rank(R::AbstractMatrix{Float64}, rtol::Float64)
+function _certified_full_rank(R::AbstractMatrix{Float64}, rtol::Float64, atol::Float64=0.0, safeguard::Float64=Inf)
     nf = norm(R)
     (isfinite(nf) && nf > 0) || return false
     Rinv = try
@@ -283,6 +287,8 @@ function _certified_full_rank(R::AbstractMatrix{Float64}, rtol::Float64)
     end
     ni = norm(Rinv)
     isfinite(ni) || return false
+    # The threshold grows with s_max, so its value at the bound ||R||_F is an upper bound.
+    atol > 0 && return inv(ni) > 16 * _truncation_threshold(nf, max(rtol, size(R, 1) * eps(Float64)), atol, safeguard)
     return inv(ni * nf) > 16 * max(rtol, size(R, 1) * eps(Float64))
 end
 
@@ -333,7 +339,7 @@ function _transfer_basis!(cb::ClusterBasis, Lt, triangular::Bool, ctx::_BasisBui
     # Lt admits a cheap certificate that no truncation occurs (saturation).
     if triangular && kc <= ctx.maxrank && size(Lt) == (kc, kc) &&
        all(child -> _full_identity(kinds, child), cb.children) &&
-       _certified_full_rank(Lt, ctx.rtol)
+       _certified_full_rank(Lt, ctx.rtol, ctx.atol, ctx.safeguard)
         return _mark_identity_embedding!(cb, kc, kinds)
     end
     irange = index_range(cb.cluster)
@@ -347,7 +353,7 @@ function _transfer_basis!(cb::ClusterBasis, Lt, triangular::Bool, ctx::_BasisBui
     # Left singular vectors of the projected active set = right ones of Pt,
     # which a tall Pt shares with its triangular QR factor (cheaper SVD).
     F = svd!(_square_factor!(Pt))
-    k = _truncation_rank(F.S, ctx.rtol, ctx.maxrank)
+    k = _context_rank(ctx, F.S)
     _record_rank_cap!(ctx, F.S, k)
     if k == 0
         _set_empty_parent_basis!(cb)
@@ -648,7 +654,8 @@ function _finish_fills!(f::_EagerFill)
     return f
 end
 
-function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict, threads, consume)
+function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict, threads, consume,
+                                           atol=0.0, safeguard=Inf)
     rt = HMatrices.rowtree(hmat)
     ct = HMatrices.coltree(hmat)
     rb = build_cluster_basis(rt)
@@ -667,8 +674,8 @@ function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict,
     lk = ReentrantLock()
     spawn_min = _condensed_spawn_min(threads)
     nn = length(kinds.kind)
-    rctx = _BasisBuildContext(data, rtol, maxrank, true, capped, lk, kinds, spawn_min, fill, _BasisSchedule(rb, nn))
-    cctx = _BasisBuildContext(data, rtol, maxrank, false, capped, lk, kinds, spawn_min, fill, _BasisSchedule(cb, nn))
+    rctx = _BasisBuildContext(data, rtol, atol, safeguard, maxrank, true, capped, lk, kinds, spawn_min, fill, _BasisSchedule(rb, nn))
+    cctx = _BasisBuildContext(data, rtol, atol, safeguard, maxrank, false, capped, lk, kinds, spawn_min, fill, _BasisSchedule(cb, nn))
     task = nothing
     try
         if threads

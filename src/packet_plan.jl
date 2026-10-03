@@ -16,12 +16,19 @@
 # tasks of a phase write the same entries, and every task has a fixed
 # evaluation order: products are deterministic and bitwise independent of the
 # worker count and of the dynamic task assignment.
+# A factored segment (coupling `S = L*R'` kept as factors) stores `L` in
+# `matrix` and `R` in `factors[segment]`; a direct segment stores `S` in
+# `matrix` and has a 0×0 entry. An empty `factors` marks an all-direct packet.
+# Every segment owns `length(column range)` slot entries in adjoint products.
 struct _CouplingPacket
     matrix::Matrix{Float64}
     row::UnitRange{Int}
     columns::Vector{UnitRange{Int}}
     slot::Int
+    factors::Vector{Matrix{Float64}}
 end
+const _DIRECT_SEGMENT=zeros(Float64,0,0)
+const _ALL_DIRECT=Matrix{Float64}[]
 struct _NearPacket
     matrix::Matrix{Float64}
     col::UnitRange{Int}
@@ -59,7 +66,7 @@ end
 _MultiWorkspace()=_MultiWorkspace(0,Float64[],Float64[],Float64[],Float64[],Float64[],Vector{Float64}[])
 """
     H2PacketMatvecPlan(h2; workers=1, consume=false)
-    H2PacketMatvecPlan(compact_plan; workers=1)
+    H2PacketMatvecPlan(compact_plan; workers=1, keep_factors=true)
 
 Pack interactions into contiguous packets applied by fused long-column
 kernels. Couplings sharing a row coefficient range form row packets; dense
@@ -75,6 +82,12 @@ needed. `workers>1` applies tasks with dynamic, cost-ordered scheduling;
 every task has a fixed evaluation order, so products are deterministic and
 bitwise independent of the worker count. Use BLAS threads=1 when enabling
 packet workers.
+
+Couplings that `H2CompactMatvecPlan(h2; coupling_rtol)` stores as factors
+`S = L*R'` keep their factors (`keep_factors=true`): `L` joins the row packet
+and `R` is applied per segment (`R'*x` forward, `R*(L'*y)` in adjoint
+products), so the packet stores exactly the compact plan's numbers, and
+zero-rank couplings are dropped. `keep_factors=false` multiplies them out.
 
 `mul!(Y, plan, X)` and `mul!(Y, adjoint(plan), X)` with matrices apply several
 right-hand sides while streaming the stored operator once.
@@ -172,7 +185,7 @@ function _tree_schedule(nodes,order,spans,refs::Vector{Vector{_SlotRef}},extra::
     end
     _TreeSchedule(order,jobs[sortperm(costs;rev=true)],flat)
 end
-function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,_release::Bool=false)
+function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,keep_factors::Bool=true,_release::Bool=false)
     workers>0 || throw(ArgumentError("workers must be positive"))
     tracker=_release ? _ReleaseTracker(storage_bytes(p)) : nothing
     groups=Dict{Int,Vector{Int}}();order=Int[]
@@ -184,22 +197,31 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,_release::Bool
             push!(groups[b.row],i)
         end
     end
-    packets=_CouplingPacket[];slot=0
+    packets=_CouplingPacket[];slot=0;maxfactor=0
     for row in order
-        columns=UnitRange{Int}[];blocks=Matrix{Float64}[]
+        columns=UnitRange{Int}[];blocks=Matrix{Float64}[];factors=Matrix{Float64}[];anyfactor=false
         for i in groups[row]
-            b=p.couplings[i]
-            push!(columns,p.cols[b.col].coeff)
-            S=b isa _PlanCoupling ? b.S : (b.R===nothing ? b.L : b.L*b.R')
-            push!(blocks,S)
+            b=p.couplings[i];cc=p.cols[b.col].coeff
+            if b isa _PlanCoupling || b.R===nothing
+                push!(columns,cc);push!(blocks,b isa _PlanCoupling ? b.S : b.L);push!(factors,_DIRECT_SEGMENT)
+            elseif size(b.R,2)>0      # zero-rank couplings contribute nothing
+                push!(columns,cc)
+                if keep_factors
+                    push!(blocks,b.L);push!(factors,b.R);anyfactor=true;maxfactor=max(maxfactor,size(b.R,2))
+                else
+                    push!(blocks,b.L*b.R');push!(factors,_DIRECT_SEGMENT)
+                end
+            end
         end
-        matrix=reduce(hcat,blocks)
+        matrix=isempty(blocks) ? zeros(0,0) : reduce(hcat,blocks)
         if _release
             empty!(blocks)
             for i in groups[row];p.couplings[i]=_released_coupling(p.couplings[i]);end
-            _released!(tracker,sizeof(matrix))
+            _released!(tracker,sizeof(matrix)+sum(sizeof,factors;init=0))
         end
-        push!(packets,_CouplingPacket(matrix,p.rows[row].coeff,columns,slot));slot+=size(matrix,2)
+        isempty(columns) && continue
+        push!(packets,_CouplingPacket(matrix,p.rows[row].coeff,columns,slot,anyfactor ? factors : _ALL_DIRECT))
+        slot+=sum(length,columns)
     end
     rowslots=slot
     rorder,rspans=_tree_tops(p.rows);corder,cspans=_tree_tops(p.cols)
@@ -269,7 +291,7 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,_release::Bool
     # Near-field packets need no upward pass; they share the first phase with it.
     tasks=sortperm([length(b.matrix) for b in packets];rev=true)
     neartasks=.-sortperm([length(b.matrix) for b in nearpackets];rev=true)
-    maxrows=maximum((size(b.matrix,1) for b in nearpackets);init=0)
+    maxrows=max(maximum((size(b.matrix,1) for b in nearpackets);init=0),maxfactor)
     rowdown=_tree_schedule(p.rows,rorder,rspans,rowrefs,extra)
     # Forward products start the downward pass of a row subtree as soon as its
     # last coupling packet completes. Subtrees with the costliest downward
@@ -292,6 +314,38 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,_release::Bool
 end
 _released_coupling(b::_PlanCoupling)=_PlanCoupling(_RELEASED_BLOCK,b.row,b.col)
 _released_coupling(b::_LowRankPlanCoupling)=_LowRankPlanCoupling(_RELEASED_BLOCK,nothing,Float64[],b.row,b.col)
+# Adjoint coupling packet with factored segments: slot segment = R*(L'*y) or S'*y.
+function _packet_transpose_factored!(s,s0,b::_CouplingPacket,rowcoeff,z)
+    M=b.matrix;y0=first(b.row)-1;offset=0;so=s0
+    @inbounds for (q,cr) in enumerate(b.columns)
+        R=b.factors[q];len=length(cr)
+        for i in 1:len;s[so+i]=0.;end
+        if size(R,1)==0
+            _kernel_t!(s,so,M,offset,len,rowcoeff,y0);offset+=len
+        else
+            r=size(R,2)
+            for i in 1:r;z[i]=0.;end
+            _kernel_t!(z,0,M,offset,r,rowcoeff,y0)
+            _kernel_n!(s,so,R,0,r,z,0);offset+=r
+        end
+        so+=len
+    end
+end
+# Forward coupling packet with factored segments: y += S*x or L*(R'*x).
+function _packet_forward_factored!(rowcoeff,b::_CouplingPacket,colcoeff,z)
+    M=b.matrix;y0=first(b.row)-1;offset=0
+    @inbounds for (q,cr) in enumerate(b.columns)
+        R=b.factors[q]
+        if size(R,1)==0
+            _kernel_n!(rowcoeff,y0,M,offset,length(cr),colcoeff,first(cr)-1);offset+=length(cr)
+        else
+            r=size(R,2)
+            for i in 1:r;z[i]=0.;end
+            _kernel_t!(z,0,R,0,r,colcoeff,first(cr)-1)
+            _kernel_n!(rowcoeff,y0,M,offset,r,z,0);offset+=r
+        end
+    end
+end
 Base.size(p::H2PacketMatvecPlan)=p.shape
 
 # Kernels on column-major `M` with `m` rows; `c0` is a 0-based column offset.
@@ -374,7 +428,10 @@ end
 function _interaction_task!(p,k,w,t)
     if k>0
         b=p.packets[k];M=b.matrix
-        if t
+        if !isempty(b.factors)
+            t ? _packet_transpose_factored!(p.slots,b.slot,b,p.rowcoeff,p.scratch[w]) :
+                _packet_forward_factored!(p.rowcoeff,b,p.colcoeff,p.scratch[w])
+        elseif t
             s=p.slots;s0=b.slot
             @inbounds for j in 1:size(M,2);s[s0+j]=0.;end
             _kernel_t!(s,s0,M,0,size(M,2),p.rowcoeff,first(b.row)-1)
@@ -468,7 +525,8 @@ LinearAlgebra.mul!(y::AbstractVector,p::TransposedPacketH2Plan,x::AbstractVector
 Base.:*(p::Union{H2PacketMatvecPlan,TransposedPacketH2Plan},x::AbstractVector)=mul!(zeros(size(p,1)),p,x)
 function storage_bytes(p::H2PacketMatvecPlan)
     sum((sizeof(n.V)+sizeof(n.E) for ns in (p.rows,p.cols) for n in ns);init=0)+
-    sum((sizeof(b.matrix) for b in p.nearpackets);init=0)+sum((sizeof(b.matrix) for b in p.packets);init=0)
+    sum((sizeof(b.matrix) for b in p.nearpackets);init=0)+
+    sum((sizeof(b.matrix)+sum(sizeof,b.factors;init=0) for b in p.packets);init=0)
 end
 function Base.copy(p::H2PacketMatvecPlan)
     H2PacketMatvecPlan(p.shape,p.rows,p.cols,p.packets,p.nearpackets,p.tasks,p.neartasks,p.fwdtasks,p.packetjob,p.jobdeps,p.rowup,p.colup,p.rowdown,p.coldown,p.workers,

@@ -156,7 +156,9 @@ function _interaction_task_k!(p,ws,k,w,t,K)
     lrc=length(p.rowcoeff);lcc=length(p.colcoeff);lrb=length(p.rowbuffer);lcb=length(p.colbuffer);ls=length(p.slots)
     if k>0
         b=p.packets[k];M=b.matrix
-        if t
+        if !isempty(b.factors)
+            _factored_task_k!(ws,b,ws.scratch[w],t,K,lrc,lcc,ls)
+        elseif t
             s=ws.slots
             @inbounds for v in 0:K-1, j in 1:size(M,2);s[b.slot+j+v*ls]=0.;end
             _kernel_tk!(s,b.slot,ls,M,0,size(M,2),ws.rowcoeff,first(b.row)-1,lrc,K)
@@ -184,6 +186,40 @@ function _interaction_task_k!(p,ws,k,w,t,K)
             _kernel_nk!(s,b.slot,ls,M,0,size(M,2),ws.colbuffer,first(b.col)-1,lcb,K)
         end
     end
+end
+# Coupling packet with factored segments (see `_packet_forward_factored!`);
+# `z` holds `r × K` intermediate blocks.
+function _factored_task_k!(ws,b::_CouplingPacket,z,t,K,lrc,lcc,ls)
+    M=b.matrix;y0=first(b.row)-1;offset=0
+    if t
+        s=ws.slots;so=b.slot
+        @inbounds for (q,cr) in enumerate(b.columns)
+            R=b.factors[q];len=length(cr)
+            for v in 0:K-1, i in 1:len;s[so+i+v*ls]=0.;end
+            if size(R,1)==0
+                _kernel_tk!(s,so,ls,M,offset,len,ws.rowcoeff,y0,lrc,K);offset+=len
+            else
+                r=size(R,2)
+                for i in 1:r*K;z[i]=0.;end
+                _kernel_tk!(z,0,r,M,offset,r,ws.rowcoeff,y0,lrc,K)
+                _kernel_nk!(s,so,ls,R,0,r,z,0,r,K);offset+=r
+            end
+            so+=len
+        end
+    else
+        @inbounds for (q,cr) in enumerate(b.columns)
+            R=b.factors[q]
+            if size(R,1)==0
+                _kernel_nk!(ws.rowcoeff,y0,lrc,M,offset,length(cr),ws.colcoeff,first(cr)-1,lcc,K);offset+=length(cr)
+            else
+                r=size(R,2)
+                for i in 1:r*K;z[i]=0.;end
+                _kernel_tk!(z,0,r,R,0,r,ws.colcoeff,first(cr)-1,lcc,K)
+                _kernel_nk!(ws.rowcoeff,y0,lrc,M,offset,r,z,0,r,K);offset+=r
+            end
+        end
+    end
+    nothing
 end
 function _forward_task_k!(p,ws,i,w,K,down::F) where {F}
     k=p.fwdtasks[i]

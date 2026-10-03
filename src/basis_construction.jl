@@ -354,17 +354,29 @@ function _filter_blocks_for_cluster(far_blocks, cluster)
 end
 
 """
-    _truncation_rank(S, rtol, maxrank)
+    _truncation_rank(S, rtol, maxrank, atol=0, safeguard=Inf)
 
-Determine the truncation rank from a vector of singular values `S`.
+Determine the truncation rank from a vector of singular values `S` (sorted in
+decreasing order): the number of values above
+`max(rtol*S[1], min(atol, safeguard*S[1]))`, at most `maxrank`.
+
+With the default `atol=0` this is the block-relative rule `S[i] > rtol*S[1]`.
+A positive `atol` adds an absolute (global) threshold, and a finite
+`safeguard` keeps every value above `safeguard*S[1]` regardless of `atol`.
 """
-function _truncation_rank(S::AbstractVector, rtol::Real, maxrank::Int)
+function _truncation_rank(S::AbstractVector, rtol::Real, maxrank::Int, atol::Real=0.0, safeguard::Real=Inf)
     isempty(S) && return 0
-    threshold = rtol * S[1]
+    threshold = _truncation_threshold(S[1], rtol, atol, safeguard)
     k = 0
     for s in S
         s > threshold || break
         k += 1
     end
     return min(k, maxrank, length(S))
+end
+
+# Monotone nondecreasing in `s1`; with `atol == 0` exactly `rtol * s1`.
+function _truncation_threshold(s1::Real, rtol::Real, atol::Real, safeguard::Real)
+    atol > 0 || return rtol * s1
+    return max(rtol * s1, isinf(safeguard) ? atol : min(atol, safeguard * s1))
 end
