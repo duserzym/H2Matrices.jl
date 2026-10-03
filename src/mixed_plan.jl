@@ -261,9 +261,11 @@ perturbation of products: `E‖(Ã-A)x‖² / E‖Ax‖² ≤ precision_rtol²`;
 per-vector guarantee. A packet is eligible for Float32 (48-bit) rows only if
 its Frobenius norm is below `floatmax(Float32)/2` (`floatmax(Float64)/4`), so
 reduced-precision rows cannot overflow; an operator whose `η` is not finite is
-stored entirely in Float64. `precision_rtol=0` keeps everything in Float64;
-its products are then bitwise identical to `H2PacketMatvecPlan`. Near-field blocks always stay in Float64 (their
-spectra are flat, so rotating them saves almost nothing).
+stored entirely in Float64 (and Float64 subnormal entries, below about
+`2e-308`, are not covered by the 48-bit relative rounding bound).
+`precision_rtol=0` keeps everything in Float64; its products are then bitwise
+identical to `H2PacketMatvecPlan`. Near-field blocks always stay in Float64
+(their spectra are flat, so rotating them saves almost nothing).
 
 Forward and adjoint products apply the same stored values, so
 `adjoint(plan)` is the exact transpose of the stored mixed operator.

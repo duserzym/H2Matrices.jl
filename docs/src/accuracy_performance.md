@@ -42,6 +42,7 @@ These are the validated PLAG066 parameters, not universal defaults. Tightening `
 | `H2CompactMatvecPlan(h2)` | Also remove saturated bases via implicit identities | None by default | No object reference; some matrices are shared |
 | `H2PacketMatvecPlan(h2; workers=1)` | Compact bases plus contiguous interaction packets | None by default | No object reference; some matrices are shared |
 | `H2LowRankMatvecPlan(h2; rtol=...)` | Factor selected couplings to reduce storage | Local SVD truncation | No object reference; some matrices are shared |
+| `H2MixedPacketMatvecPlan(h2; workers=1, precision_rtol=1e-13)` | Packet plan with low-weight coupling rows in Float32 (optionally 48-bit) | Bounded reduced-precision rounding (`precision_rtol`) | No object reference; some matrices are shared |
 
 Compact, packet and low-rank plans are matvec-only operators; they do not provide general matrix indexing or recompression. Keep an assembly representation only if those operations are needed. Plans retain the matrices and metadata needed for their products, so they remain usable after the source object goes out of scope.
 
@@ -126,6 +127,30 @@ recompress!(h2; rtol=1e-9, maxrank=512, strict=true)
 ```
 
 A rejected strict rank cap leaves `h2` unchanged. The temporary copy increases setup memory. Conversion and recompression traverse active children even when their parent has rank zero.
+
+## Mixed-precision packet storage
+
+```julia
+BLAS.set_num_threads(1)
+plan = H2MixedPacketMatvecPlan(h2; workers=4, precision_rtol=1e-13, consume=true)
+precision_summary(plan)        # bound, reference norm, Float32 rows, byte counts
+```
+
+Each coupling packet is rotated to its left singular basis; rows of small singular weight are stored in Float32 (with `format48=true` also in a 48-bit format) and every product accumulates in Float64. The rows are chosen to minimize bytes under the a priori bound `‖Ã - A‖_F ≤ precision_rtol · η` on the reduced-precision rounding, where `η` is the Frobenius norm of the stored blocks (`‖A‖_F` for orthonormal bases). It is a root-mean-square bound on product perturbations, not a per-vector guarantee, and it does not include the Float64 roundoff of the rotations themselves. The near field stays in Float64.
+
+The plan runs on the packet-plan engine with the same kernels: forward and adjoint products apply the same stored values (the adjoint is an exact transpose), products are bitwise independent of the worker count, several right-hand sides are supported, and `precision_rtol=0` reproduces `H2PacketMatvecPlan` bitwise. Construction is deterministic under threads. It costs about one to three extra seconds on the meshes below (eigen-decompositions of packet Gram matrices) and does not raise the build's peak memory, which the H → H² conversion sets.
+
+Measured on the PLAG066/PLAG036 boundary operators (nb 6028/12415; `nmax=32`, `eta=3`, `aca_rtol=1e-11`, `rtol=1e-10`, `maxrank=512/2048`, strict):
+
+| `precision_rtol` | Operator MB (PLAG066 / PLAG036) | Relative error vs dense, forward (PLAG066 / PLAG036) |
+|---|---|---|
+| packet plan (Float64) | 302.8 / 714.8 | 1.8496e-11 / 7.7053e-11 |
+| `1e-13` | 256.8 / 637.2 | 1.8496e-11 / 7.7054e-11 |
+| `1e-13`, `format48=true` | 225.2 / 578.1 | 1.8496e-11 / 7.7054e-11 |
+
+The difference from the Float64 operator is about `4e-14` relative, three orders of magnitude below the compression error, so errors against the dense operator change by at most `5e-5` of their value (in either direction).
+
+Single-vector products read fewer bytes and are memory-bound, so they get faster: same-process medians with four workers (BLAS threads=1, 14-core Apple M4 Pro, shared machine) were 1.87/1.68 ms forward/adjoint against 2.02/1.74 ms for the packet plan on PLAG066 and 4.44/4.28 against 4.76/4.42 ms on PLAG036 (six workers: 1.56/1.52 against 1.83/1.70 and 3.78/3.78 against 4.04/4.18 ms). With several right-hand sides the kernels are compute-bound; the mixed plan does the same number of multiply-adds plus the widening, so per-vector times with nine vectors were 1–17% slower than the packet plan's. `format48=true` saves another 9–12% of operator bytes at similar single-vector speed and 20–35% slower multi-vector products. Looser `precision_rtol` saves more bytes (`1e-12`: about 6% more) but starts to change the operator at the compression-error level; validate it before use.
 
 ## Validate before enlarging a campaign
 
