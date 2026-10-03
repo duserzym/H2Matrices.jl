@@ -16,10 +16,17 @@ function _compact_basis(root)
     end
     visit(root)
     ids=IdDict(cb=>i for (i,cb) in enumerate(originals))
-    saturated=IdDict{typeof(root),Matrix{Float64}}()
+    # `nothing` marks a saturated basis whose expansion is exactly the identity
+    # (as produced by the condensed H-matrix conversion): multiplying by it is
+    # skipped, which gives bitwise the same couplings and transfers.
+    saturated=IdDict{typeof(root),Union{Nothing,Matrix{Float64}}}()
+    exact=IdDict{typeof(root),Bool}()
+    for cb in Iterators.reverse(originals)
+        exact[cb]=_is_exact_identity_basis(cb,exact)
+    end
     for cb in originals
         if cb.k>=length(cb) && cb.k>0
-            saturated[cb]=_full_basis(cb)
+            saturated[cb]=exact[cb] ? nothing : _full_basis(cb)
         end
     end
     nodes=_CompactBasisNode[];offset=first(index_range(root.cluster))-1;total=0
@@ -32,7 +39,7 @@ function _compact_basis(root)
         E=if isroot(cb) || haskey(saturated,cb.parent)
             zeros(Float64,0,0)
         elseif identity
-            saturated[cb]*cb.E
+            _expand_left(saturated[cb],cb.E)
         else
             cb.E
         end
@@ -41,6 +48,27 @@ function _compact_basis(root)
             [ids[c] for c in cb.children],identity))
     end
     nodes,ids,saturated,zeros(total)
+end
+_expand_left(::Nothing,S)=S
+_expand_left(V::Matrix{Float64},S)=V*S
+_expand_right(S,::Nothing)=S
+_expand_right(S,W::Matrix{Float64})=S*W'
+# Is the expanded basis of `cb` exactly the identity? `exact` holds the answer
+# for all children (reverse preorder).
+function _is_exact_identity_basis(cb,exact)
+    m=length(cb)
+    cb.k==m && m>0 || return false
+    isleaf(cb) && return size(cb.V)==(m,m) && cb.V==I
+    off=0
+    for child in cb.children
+        exact[child] || return false
+        E=child.E
+        size(E)==(child.k,cb.k) || return false
+        iszero(view(E,:,1:off)) && view(E,:,off+1:off+child.k)==I &&
+            iszero(view(E,:,off+child.k+1:cb.k)) || return false
+        off+=child.k
+    end
+    off==cb.k
 end
 """
     H2CompactMatvecPlan(h2; coupling_rtol=nothing)
@@ -91,8 +119,8 @@ function H2CompactMatvecPlan(h2::H2Matrix;coupling_rtol::Union{Nothing,Float64}=
                 S=h.uniform.S
                 # Physical row expansion and column projection of the original
                 # basis are preserved, without relying on its orthogonality.
-                haskey(ru,h.row_basis) && (S=ru[h.row_basis]*S)
-                haskey(cu,h.col_basis) && (S=S*cu[h.col_basis]')
+                haskey(ru,h.row_basis) && (S=_expand_left(ru[h.row_basis],S))
+                haskey(cu,h.col_basis) && (S=_expand_right(S,cu[h.col_basis]))
                 r=ri[h.row_basis];c=ci[h.col_basis]
                 push!(couplings,coupling_rtol===nothing ? _PlanCoupling(S,r,c) : _factor_plan_coupling(S,r,c,coupling_rtol))
             elseif h.dense!==nothing

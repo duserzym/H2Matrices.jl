@@ -41,6 +41,18 @@ The algorithm:
 - `global_index` : whether matvec inputs and outputs use global DOF ordering
 - `strict` : throw if the rank cap prevents any requested local SVD tolerance;
   otherwise warn. Local tolerances are not a global operator error certificate.
+- `threads` : build row/column bases, independent subtrees and couplings with
+  Julia tasks. Results are bitwise independent of the thread count. Defaults
+  to true when Julia has several threads and BLAS uses one thread.
+- `consume` : release each H-matrix block once it has been converted (the
+  near-field blocks move into the H² matrix without copying). `hmat` must not
+  be used afterwards. A strict rank-cap failure is raised before any release.
+
+Ancestor interactions are condensed exactly: only Gram matrices of the active
+sets determine the bases, so each cluster passes a factor of width at most its
+size to its children instead of every ancestor block. A truncation that keeps
+every coefficient direction stores the identity (leaf `V = I` or an identity
+embedding), an exact change of coordinates that compact plans exploit.
 
 # Returns
 An `H2Matrix` approximating the same kernel.
@@ -50,9 +62,18 @@ function compress_hmatrix_to_h2(hmat::HMatrix;
                                 maxrank::Int=50,
                                 global_index::Bool=true,
                                 strict::Bool=false,
+                                threads::Bool=_conversion_threads_default(),
+                                consume::Bool=false,
+                                _reference::Bool=false,
                                 _print::Bool=true)
     isfinite(rtol) && rtol >= 0 || throw(ArgumentError("rtol must be finite and nonnegative"))
     maxrank > 0 || throw(ArgumentError("maxrank must be positive"))
+    if !_reference
+        h2 = _compress_hmatrix_to_h2_condensed(hmat; rtol, maxrank, strict, threads, consume)
+        h2.global_index = global_index
+        _print && _print_compression_summary(h2)
+        return h2
+    end
     rt = HMatrices.rowtree(hmat)
     ct = HMatrices.coltree(hmat)
 
@@ -70,11 +91,11 @@ function compress_hmatrix_to_h2(hmat::HMatrix;
     # Build row basis from A matrices (bottom-up with propagation)
     empty_inherited = Tuple{Matrix{Float64},UnitRange{Int}}[]
     capped_residuals = Float64[]
-    _build_adaptive_basis_recursive!(rb, row_data, empty_inherited;
+    _build_adaptive_basis_reference!(rb, row_data, empty_inherited;
                                       rtol, maxrank, is_row=true, capped_residuals)
 
     # Build col basis from B matrices (bottom-up with propagation)
-    _build_adaptive_basis_recursive!(cb, col_data, Tuple{Matrix{Float64},UnitRange{Int}}[];
+    _build_adaptive_basis_reference!(cb, col_data, Tuple{Matrix{Float64},UnitRange{Int}}[];
                                       rtol, maxrank, is_row=false, capped_residuals)
 
     if !isempty(capped_residuals)
@@ -153,6 +174,10 @@ function _collect_rk_recursive!(row_data, col_data, hmat::HMatrix)
 end
 
 """
+Reference (v0.1.3) adaptive basis construction, kept for validation of the
+condensed builder `_build_adaptive_basis_recursive!`. It passes every ancestor
+block down unchanged, so active widths grow with depth.
+
 Build adaptive basis bottom-up from collected RkMatrix data, with
 top-down propagation of ancestor-level block data to leaf clusters.
 
@@ -162,7 +187,7 @@ The `data` argument maps `objectid(cluster)` → Vector of (A=..., B=...).
 Ancestor-level blocks are propagated down: their subrows are distributed
 to child clusters so leaf bases capture all necessary column spaces.
 """
-function _build_adaptive_basis_recursive!(
+function _build_adaptive_basis_reference!(
     cb::ClusterBasis{N,T},
     data::Dict,
     inherited::Vector{Tuple{Matrix{Float64},UnitRange{Int}}};
@@ -222,7 +247,7 @@ function _build_adaptive_basis_recursive!(
 
         # 5. Recurse on children (bottom-up)
         for child in cb.children
-            _build_adaptive_basis_recursive!(child, data, new_inherited;
+            _build_adaptive_basis_reference!(child, data, new_inherited;
                                               rtol, maxrank, is_row, capped_residuals)
         end
 
@@ -267,6 +292,34 @@ function _build_adaptive_basis_recursive!(
             end
         end
     end
+    return cb
+end
+
+"""
+    _build_adaptive_basis_recursive!(cb, data, inherited; rtol, maxrank, is_row, capped_residuals)
+
+Build nested adaptive bases with exact active-set condensation (see
+`condensed_conversion.jl`). `inherited` lists ancestor matrices with their row
+ranges; their rows restricted to `cb` seed the inherited active set.
+"""
+function _build_adaptive_basis_recursive!(
+    cb::ClusterBasis,
+    data::Dict,
+    inherited::Vector{Tuple{Matrix{Float64},UnitRange{Int}}};
+    rtol::Float64=1e-8,
+    maxrank::Int=50,
+    is_row::Bool=true,
+    capped_residuals::Vector{Float64}=Float64[],
+    kinds=nothing,
+    threads::Bool=false
+)
+    kinds = kinds === nothing ? _ConversionBases(cb) : kinds
+    r = index_range(cb.cluster)
+    seed = isempty(inherited) ? nothing :
+        reduce(hcat, [M[(first(r)-first(ar)+1):(last(r)-first(ar)+1), :] for (M, ar) in inherited])
+    ctx = _BasisBuildContext(data, rtol, maxrank, is_row, capped_residuals, ReentrantLock(),
+                             kinds, _condensed_spawn_min(threads))
+    _condensed_basis!(cb, seed, ctx)
     return cb
 end
 
@@ -857,7 +910,12 @@ because the ranks adapt to the actual kernel smoothness.
 - `maxrank` : maximum rank per cluster
 - `aca_rtol` : tolerance for ACA (defaults to `rtol / 10`)
 - `strict` : reject a basis rank cap that prevents the local tolerance
+- `threads` : run the H → H² conversion with Julia tasks (deterministic;
+  defaults to true when Julia has several threads and BLAS uses one)
 - `aca_kwargs...` : additional arguments for `assemble_hmatrix`
+
+The intermediate H-matrix is private, so its blocks are released during the
+conversion (`consume=true`), lowering peak construction memory.
 """
 function assemble_h2matrix_adaptive(
     K,
@@ -869,6 +927,7 @@ function assemble_h2matrix_adaptive(
     adm=StrongAdmissibilityStd(3),
     global_index::Bool=true,
     strict::Bool=false,
+    threads::Bool=_conversion_threads_default(),
     kwargs...
 ) where {N,T}
     # Step 1: Build H-matrix via ACA
@@ -881,7 +940,8 @@ function assemble_h2matrix_adaptive(
                                        kwargs...)
 
     # Step 2: Convert to H²
-    h2 = compress_hmatrix_to_h2(hmat; rtol, maxrank, global_index, strict, _print=false)
+    h2 = compress_hmatrix_to_h2(hmat; rtol, maxrank, global_index, strict, threads,
+                                consume=true, _print=false)
 
     _print_compression_summary(h2)
     return h2
