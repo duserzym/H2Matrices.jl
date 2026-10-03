@@ -6,8 +6,10 @@
   each cluster condenses its active set (direct partner-weighted factors plus
   inherited ancestor factors) by an exact Gram-preserving QR, so widths stay at
   most the cluster size instead of accumulating every ancestor block. Truncation
-  ranks are unchanged. The v0.1.3 builder remains available as
-  `compress_hmatrix_to_h2(...; _reference=true)` for validation.
+  ranks are unchanged except for rounding-level decisions at the truncation
+  threshold (e.g. exactly rank-deficient blocks with `rtol=0`). The v0.1.3
+  builder remains available as `compress_hmatrix_to_h2(...; _reference=true)`
+  for validation.
 - Untruncated bases are stored as identity leaves or identity embeddings (an
   exact change of coordinates); a rigorous triangular-inverse certificate skips
   transfer SVDs at saturated parents; compact plans skip exact identity
@@ -21,7 +23,20 @@
   (during the basis construction; the H-matrix is unusable afterwards, also if
   the conversion throws) and `H2PacketMatvecPlan(h2; consume=true)` releases
   raw H² blocks while packing. `assemble_h2matrix_adaptive` consumes its private
-  H-matrix and accepts `threads`.
+  H-matrix; its `threads` keyword threads the H-matrix assembly (`K` must
+  allow concurrent `getblock!`), `conversion_threads` the conversion, and
+  `comp` selects the compressor.
+- Restructure `H2PacketMatvecPlan` for race-free parallel phases. Couplings
+  remain row packets; near-field blocks are split at elementary column
+  intervals into column packets. Fused long-column kernels replace gathered
+  BLAS GEMV in both directions. Transposed couplings and forward near-field
+  write private slots that the owning downward-pass task reduces in fixed
+  order. The upward pass, forward near field and downward pass now run in
+  parallel, per-worker reduction buffers are removed, and products are bitwise
+  independent of the worker count. Stored numeric data is unchanged.
+- Add `mul!(Y, plan, X)` and transpose/adjoint products with matrices for
+  packet plans, streaming the operator once per block of up to 16 right-hand
+  sides, and `multi_workspace_bytes`.
 
 ## 0.1.3
 

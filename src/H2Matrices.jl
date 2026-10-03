@@ -27,6 +27,7 @@ include("condensed_conversion.jl")
 include("copying.jl")
 include("compact_plan.jl")
 include("packet_plan.jl")
+include("packet_multi.jl")
 include("solvers.jl")
 include("plotting.jl")
 
@@ -43,6 +44,7 @@ export H2PacketMatvecPlan,
     compression_ratio,
     compression_summary,
     storage_bytes,
+    multi_workspace_bytes,
     dense_storage_bytes,
     block_stats,
     rank_stats,

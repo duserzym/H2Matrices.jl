@@ -56,11 +56,19 @@ g = zeros(size(plan, 2))
 
 mul!(y, plan, x)
 mul!(g, adjoint(plan), z)
+
+# Several right-hand sides: the operator is streamed once per block of up to 16 vectors.
+X = randn(size(plan, 2), 9)
+Y = zeros(size(plan, 1), 9)
+mul!(Y, plan, X)
+mul!(X, adjoint(plan), Y)
 ```
+
+Multi-vector products use a workspace that is allocated on first use and kept by the plan. `H2Matrices.multi_workspace_bytes(plan, k)` reports its size; it grows with `k` up to the 16-vector block width.
 
 Use `adjoint(plan)` for the adjoint of this same stored approximation. Do not independently compress a transposed kernel and assume it is identical. A useful verification is `dot(z, plan*x) ≈ dot(adjoint(plan)*z, x)`, with a tolerance appropriate for accumulated rounding.
 
-Use one BLAS thread when evaluating packet-worker speedups. Multiple packet workers and multiple BLAS threads can oversubscribe the processor. `workers=1` is the default; measure worker counts on the target grain and hardware. A one-worker warmed plan can avoid per-call allocations, while threaded paths create small scheduling objects.
+Use one BLAS thread when evaluating packet-worker speedups. Multiple packet workers and multiple BLAS threads can oversubscribe the processor. `workers=1` is the default; measure worker counts on the target grain and hardware. A one-worker warmed plan can avoid per-call allocations, while threaded paths create small scheduling objects. Packet products are bitwise independent of the worker count, so the worker count can be tuned without changing results.
 
 ## Retain only the operator you need
 
@@ -95,7 +103,7 @@ outputs = [zeros(size(plan, 1)) for _ in callers]
 end
 ```
 
-Copies share numerical matrices and traversal metadata, but own coefficient/vector scratch, factorized-coupling scratch and packet reduction buffers. Do not mutate shared data while any caller is running. When outer tasks already use the available CPU budget, one packet worker per caller can avoid excessive nested parallelism.
+Copies share numerical matrices and traversal metadata, but own coefficient/vector scratch, factorized-coupling scratch, packet slot buffers and the multi-vector workspace. Do not mutate shared data while any caller is running. When outer tasks already use the available CPU budget, one packet worker per caller can avoid excessive nested parallelism.
 
 Rebuild plans after successful recompression or source changes. `copy(plan)` creates a new workspace for the same representation; it does not rebuild it against a changed source.
 

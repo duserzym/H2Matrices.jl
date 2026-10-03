@@ -211,9 +211,13 @@ The compact plan replaces saturated cluster bases with implicit identity
 bases and moves their numerical action into couplings and parent transfers.
 It works with nonorthogonal and overcomplete bases. This changes the stored
 representation up to floating-point rounding, without relaxing tolerances.
-The packet plan groups interactions into contiguous matrices and supports
-parallel execution with private transpose buffers and fixed reduction order.
-Overlapping near-field row ranges use a safe serial forward fallback.
+The packet plan groups couplings into row packets and near-field blocks into
+column packets, applied by fused long-column kernels. Every phase (upward
+pass, interactions, slot reduction plus downward pass) runs in parallel with
+explicit write ownership, so products are deterministic and bitwise
+independent of the worker count. `mul!(Y, plan, X)` and its adjoint apply
+several right-hand sides while streaming the operator once per block of up to
+16 vectors.
 
 `workers=1` is the default and supports allocation-free warmed products on
 recent Julia compilers. Threaded plans allocate small task-scheduling objects.
