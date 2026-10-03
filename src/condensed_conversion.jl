@@ -382,13 +382,17 @@ mutable struct _BasisSchedule
     pending::Vector{Any}            # by node index: _PendingTransfer or nothing
     done::Threads.Event
     inflight::Threads.Atomic{Int}   # spawned tasks not yet finished
+    max_open::Int                   # spawn only while fewer tasks are in flight
     error::Any                      # first exception, or nothing
     lock::ReentrantLock
 end
 
-_BasisSchedule(root, nnodes::Int) =
+# Each in-flight task traverses its subtree depth first, so pending factors are
+# bounded by about `max_open` root-to-leaf paths instead of the whole tree
+# (spawning every child opens the tree breadth first).
+_BasisSchedule(root, nnodes::Int; max_open::Int=Threads.nthreads()) =
     _BasisSchedule(root, Any[nothing for _ in 1:nnodes], Threads.Event(), Threads.Atomic{Int}(0),
-                   nothing, ReentrantLock())
+                   max_open, nothing, ReentrantLock())
 
 function _schedule_failed!(sched::_BasisSchedule, err)
     lock(sched.lock) do
@@ -425,14 +429,19 @@ function _start_node!(cb::ClusterBasis, inherited_t, ctx::_BasisBuildContext)
         _PendingTransfer(Lt, triangular, Threads.Atomic{Int}(length(cb.children)))
     irange = index_range(cb.cluster)
     spawn = length(cb) >= ctx.spawn_min && length(cb.children) > 1
-    for child in cb.children
+    nc = length(cb.children)
+    for (j, child) in enumerate(cb.children)
         # Children inherit column blocks of Lt (views). Columns of an
         # upper-triangular R vanish below their own index: dropping these zero
         # rows leaves every child's Gram matrix unchanged.
         cols = _local_rows(child, irange)
         inherited = Lt === nothing ? nothing :
             triangular ? view(Lt, 1:last(cols), cols) : view(Lt, :, cols)
-        spawn ? _spawn_node!(child, inherited, ctx) : _start_node!(child, inherited, ctx)
+        if spawn && j < nc && ctx.sched.inflight[] < ctx.sched.max_open
+            _spawn_node!(child, inherited, ctx)
+        else
+            _start_node!(child, inherited, ctx)
+        end
     end
     return nothing
 end
