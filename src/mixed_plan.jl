@@ -47,24 +47,35 @@ end
 const _Rows64 = _InterleavedRows{Float64,Vector{Float64}}
 const _Rows48 = _InterleavedRows{_T48,_Planes48}
 const _Rows32 = _InterleavedRows{Float32,Vector{Float32}}
-function _InterleavedRows{T}(A::AbstractMatrix) where {T}
-    rows, N = size(A); data = _storage(T, rows * N); g4 = rows ÷ 4
-    @inbounds for g in 0:g4-1, j in 1:N, q in 1:4
-        _put!(data, 4N*g+4(j-1)+q, A[4g+q, j])
-    end
-    @inbounds for r in 1:rows%4, j in 1:N
-        _put!(data, 4N*g4+N*(r-1)+j, A[4g4+r, j])
-    end
-    _InterleavedRows{T,typeof(data)}(data, rows, N)
+# Position of entry (i, j) in the interleaved storage of a `rows x N` matrix.
+@inline function _il_index(rows, N, i, j)
+    g4 = rows ÷ 4; g = (i - 1) >> 2
+    g < g4 ? 4N * g + 4(j - 1) + (i - 4g) : 4N * g4 + N * (i - 4g4 - 1) + j
 end
-_eltype(::_InterleavedRows{T}) where {T} = T === _T48 ? Float64 : T
-function Base.Matrix(A::_InterleavedRows)
-    M = Matrix{_eltype(A)}(undef, A.rows, A.N); N = A.N; g4 = A.rows ÷ 4
-    for g in 0:g4-1, j in 1:N, q in 1:4
-        M[4g+q, j] = _ld(A.data, 4N*g+4(j-1)+q)
+_InterleavedRows{T}(::UndefInitializer, rows::Int, N::Int) where {T} =
+    (d = _storage(T, rows * N); _InterleavedRows{T,typeof(d)}(d, rows, N))
+# Store A (rows x n) into columns coloff+1:coloff+n.
+function _put_block!(S::_InterleavedRows, A::AbstractMatrix, coloff::Int)
+    rows, N, d = S.rows, S.N, S.data
+    @inbounds for j in axes(A, 2), i in 1:rows
+        _put!(d, _il_index(rows, N, i, coloff + j), A[i, j])
     end
-    for r in 1:A.rows%4, j in 1:N
-        M[4g4+r, j] = _ld(A.data, 4N*g4+N*(r-1)+j)
+    S
+end
+# Squared Frobenius norm of (stored - A) over columns coloff+1:coloff+n, without copies.
+function _rounding_err2(S::_InterleavedRows, A::AbstractMatrix, coloff::Int=0)
+    rows, N, d = S.rows, S.N, S.data; e = 0.0
+    @inbounds for j in axes(A, 2), i in 1:rows
+        e += abs2(_ld(d, _il_index(rows, N, i, coloff + j)) - A[i, j])
+    end
+    e
+end
+_InterleavedRows{T}(A::AbstractMatrix) where {T} = _put_block!(_InterleavedRows{T}(undef, size(A)...), A, 0)
+_eltype(::_InterleavedRows{T}) where {T} = T === _T48 ? Float64 : T
+function Base.Matrix(S::_InterleavedRows)
+    M = Matrix{_eltype(S)}(undef, S.rows, S.N)
+    for j in 1:S.N, i in 1:S.rows
+        M[i, j] = _ld(S.data, _il_index(S.rows, S.N, i, j))
     end
     M
 end
@@ -366,9 +377,17 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
     neargroups, nearorder = _leaf_near_groups(p)
     nf = length(order); nn = length(nearorder); np = nf + nn
     _coupling_matrix(b) = b isa _PlanCoupling ? b.S : (b.R === nothing ? b.L : b.L * b.R')
-    # Packets 1:nf are far-field (one per row node), nf+1:np near-field (one per leaf row range).
-    packet_matrix(t) = t <= nf ? reduce(hcat, [_coupling_matrix(p.couplings[i]) for i in groups[order[t]]]) :
-        reduce(hcat, [p.dense[i].D[rr, :] for (i, rr) in neargroups[nearorder[t-nf]]])
+    # Packets 1:nf are far-field (one per row node), nf+1:np near-field (one per
+    # leaf row range). Packets are processed block by block and never materialized.
+    packet_blocks(t) = t <= nf ? [_coupling_matrix(p.couplings[i]) for i in groups[order[t]]] :
+        [view(p.dense[i].D, rr, :) for (i, rr) in neargroups[nearorder[t-nf]]]
+    function gram(blocks, k)
+        G = zeros(k, k)
+        for B in blocks
+            mul!(G, B, B', 1.0, 1.0)
+        end
+        Symmetric(G)
+    end
     packet_columns(t) = t <= nf ? [p.cols[p.couplings[i].col].coeff for i in groups[order[t]]] :
         [p.dense[i].cols for (i, _) in neargroups[nearorder[t-nf]]]
     rownorm = _compact_basis_norms(p.rows); colnorm = _compact_basis_norms(p.cols)
@@ -379,16 +398,15 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
     beta2 = [t <= nf ? (rownorm[order[t]] * maximum(colnorm[p.couplings[i].col] for i in groups[order[t]]))^2 : 1.0 for t in 1:np]
     # Rotations of explicit far-field row bases are absorbed; implicit and physical rows store U.
     explicitU = [t > nf || p.rows[order[t]].identity for t in 1:np]
-    # Pass 1: squared row weights ω² (Gram eigenvalues, padded by an eigensolver
-    # error estimate) of every packet; packet matrices are temporary. Only the
+    # Pass 1: squared row weights ω² (eigenvalues of the Gram matrix Σ B Bᵀ over
+    # the packet blocks, padded by an eigensolver error estimate). Only the
     # selection uses these weights; the reported bound uses the stored rows.
     om2 = [Float64[] for _ in 1:np]; fro2 = zeros(np)
     rot = precision_rtol > 0
-    gram_eig(M) = eigen(Symmetric(M * M'); alg=LinearAlgebra.DivideAndConquer())
     Threads.@threads :dynamic for t in 1:np
-        M = packet_matrix(t); fro2[t] = sum(abs2, M)
+        blocks = packet_blocks(t); fro2[t] = sum(B -> sum(abs2, B), blocks)
         if rot
-            λ = eigvals(Symmetric(M * M'); alg=LinearAlgebra.DivideAndConquer())
+            λ = eigvals!(gram(blocks, ks[t]); alg=LinearAlgebra.DivideAndConquer())
             om2[t] = max.(λ[end:-1:1], 0.0) .+ 8 * eps() * max(λ[end], 0.0)
         end
     end
@@ -401,29 +419,36 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
     packets = Vector{_MixedPacket}(undef, np)
     lo2 = zeros(np); err2 = zeros(np); Uabs = Vector{Matrix{Float64}}(undef, np)
     Threads.@threads :dynamic for t in 1:np
-        M = packet_matrix(t); k = ks[t]; r1 = n64[t]; rm = r1 + r48[t]
+        blocks = packet_blocks(t); k = ks[t]; N = Ns[t]; r1 = n64[t]; rm = r1 + r48[t]
         nref = r32[t] > 0 ? rm : r1
-        hv = Float64[]; tau = Float64[]
-        U = rotated[t] ? gram_eig(M).vectors[:, end:-1:1] : zeros(0, 0)
-        W = if !rotated[t]
-            M
-        elseif !explicitU[t]
-            Uabs[t] = U
-            U' * M
-        else
-            # Householder QR of the leading singular vectors: the spans of
-            # Q[:, 1:j] and U[:, 1:j] agree for every j <= nref.
-            A, tau = LAPACK.geqrf!(U[:, 1:nref])
-            Q = LAPACK.ormqr!('L', 'N', A, tau, Matrix{Float64}(I, k, k))
-            hv = reduce(vcat, [A[i+1:k, i] for i in 1:nref])
-            Q' * M
+        hv = Float64[]; tau = Float64[]; Q = zeros(0, 0)
+        if rotated[t]
+            U = reverse!(eigen!(gram(blocks, k); alg=LinearAlgebra.DivideAndConquer()).vectors; dims=2)
+            if !explicitU[t]
+                Uabs[t] = U; Q = U
+            else
+                # Householder QR of the leading singular vectors (in place): the
+                # spans of Q[:, 1:j] and U[:, 1:j] agree for every j <= nref.
+                A, tau = LAPACK.geqrf!(view(U, :, 1:nref))
+                hv = reduce(vcat, [A[i+1:k, i] for i in 1:nref]; init=Float64[])
+                Q = LAPACK.ormqr!('L', 'N', A, tau, Matrix{Float64}(I, k, k))
+            end
         end
-        hiW = view(W, 1:r1, :); midW = view(W, r1+1:rm, :); loW = view(W, rm+1:k, :)
-        midrows = _InterleavedRows{_T48}(midW); lorows = _InterleavedRows{Float32}(loW)
-        lo2[t] = beta2[t] * (_U32^2 * sum(abs2, loW) + length(loW) * 2.0^-300 + _U48^2 * sum(abs2, midW))
-        err2[t] = beta2[t] * (sum(abs2, Float64.(Matrix(lorows)) .- loW) + sum(abs2, Matrix(midrows) .- midW))
-        packets[t] = _MixedPacket(outrows[t], columns[t], _InterleavedRows{Float64}(hiW), midrows, lorows,
-            hv, tau, zeros(Ns[t]), zeros(isempty(tau) ? 0 : k))
+        hirows = _InterleavedRows{Float64}(undef, r1, N)
+        midrows = _InterleavedRows{_T48}(undef, rm - r1, N); lorows = _InterleavedRows{Float32}(undef, k - rm, N)
+        off = 0; c = 0.0; e = 0.0
+        wbuf = rotated[t] ? Matrix{Float64}(undef, k, maximum(B -> size(B, 2), blocks)) : zeros(0, 0)
+        for B in blocks
+            Wb = rotated[t] ? mul!(view(wbuf, :, 1:size(B, 2)), Q', B) : B
+            hiW = view(Wb, 1:r1, :); midW = view(Wb, r1+1:rm, :); loW = view(Wb, rm+1:k, :)
+            _put_block!(hirows, hiW, off); _put_block!(midrows, midW, off); _put_block!(lorows, loW, off)
+            c += _U32^2 * sum(abs2, loW) + length(loW) * 2.0^-300 + _U48^2 * sum(abs2, midW)
+            e += _rounding_err2(lorows, loW, off) + _rounding_err2(midrows, midW, off)
+            off += size(B, 2)
+        end
+        lo2[t] = beta2[t] * c; err2[t] = beta2[t] * e
+        packets[t] = _MixedPacket(outrows[t], columns[t], hirows, midrows, lorows,
+            hv, tau, zeros(N), zeros(isempty(tau) ? 0 : k))
     end
     # Absorb rotations of explicit (unsaturated) row bases into transfers and leaf bases.
     absorbed = Dict{Int,Matrix{Float64}}(order[t] => Uabs[t] for t in 1:nf if rotated[t] && !explicitU[t])
