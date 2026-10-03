@@ -21,7 +21,7 @@ h2 = assemble_h2matrix_adaptive(K;
 | `strict=true` | Reject a cap that violates a requested local threshold | Mesh, path or whole-campaign convergence |
 | `coupling_rtol` | Additional local coupling SVD truncation when requested | The original stored operator's accuracy without new checks |
 | `coupling_scale=:global` | Coupling truncation relative to the largest stored block norm instead of each block's own norm | A global error bound |
-| `coupling_precision=Float32` | Float32 storage of retained coupling components below `coupling_rtol*scale/eps(Float32)`, Float64 arithmetic | Accuracy without new checks |
+| `coupling_precision=Float32` or `Float16` | Float32 (and scaled Float16) storage of small retained coupling components, Float64 arithmetic | Accuracy without new checks |
 | `passthrough=true` | Exact folding of weakly compressing transfers into couplings (compact/packet plans) | Nothing beyond rounding; it adds no tolerance |
 | `nmax`, admissibility | Tree/block partitioning and resulting ranks/work | A mesh-independent best configuration |
 
@@ -106,7 +106,7 @@ For product-only use, the exact `passthrough=true` option and the approximate gl
 
 ```julia
 compact = H2CompactMatvecPlan(h2; passthrough=true,
-    coupling_rtol=1.5e-11, coupling_scale=:global, coupling_precision=Float32)
+    coupling_rtol=1e-11, coupling_scale=:global, coupling_precision=Float16)
 plan = H2PacketMatvecPlan(compact; workers=4)
 ```
 
