@@ -387,7 +387,7 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
         M = packet_matrix(t); fro2[t] = sum(abs2, M)
         if rot
             λ = eigvals(Symmetric(M * M'); alg=LinearAlgebra.DivideAndConquer())
-            om2[t] = max.(λ[end:-1:1], 0.0) .+ length(λ) * eps() * max(λ[end], 0.0)
+            om2[t] = max.(λ[end:-1:1], 0.0) .+ 8 * eps() * max(λ[end], 0.0)
         end
     end
     eta = sqrt(sum(fro2; init=0.0))
