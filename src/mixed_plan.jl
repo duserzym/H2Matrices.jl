@@ -103,7 +103,7 @@ end
     @inbounds w1 = w[wo+1]; @inbounds w2 = w[wo+2]; @inbounds w3 = w[wo+3]; @inbounds w4 = w[wo+4]
     @inbounds @simd for j in 1:N
         q = o + 4(j - 1)
-        x[j] += muladd(_ld(d, q+1), w1, _ld(d, q+2) * w2) + muladd(_ld(d, q+3), w3, _ld(d, q+4) * w4)
+        x[j] = muladd(_ld(d, q+4), w4, muladd(_ld(d, q+3), w3, muladd(_ld(d, q+2), w2, muladd(_ld(d, q+1), w1, x[j]))))
     end
     nothing
 end
