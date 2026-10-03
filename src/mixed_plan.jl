@@ -186,8 +186,10 @@ stored in Float32 and the leading rows in Float64. Every product accumulates
 in Float64; Float32 values are only widened, never used as accumulators.
 Rotations of explicit (unsaturated) row bases are absorbed exactly into the
 stored transfers and leaf bases, so they cost no storage. For implicit
-(saturated) or physical rows, `Q` is stored as the `k - r` Householder
-reflectors that span the `r` Float64 rows. That cost enters the selection.
+(saturated) or physical rows, `Q` is stored as the `r` Householder reflectors
+spanning the rows above the lowest-precision block (about `8r(k - r/2)` bytes).
+That cost enters the selection. The rounding cost depends only on these
+subspaces, not on the basis chosen inside them.
 
 With `format48=true`, rows of intermediate weight can also use a 48-bit format:
 a Float64 rounded to 36 mantissa bits (unit roundoff `u₄₈ = 2⁻³⁷`), stored as
