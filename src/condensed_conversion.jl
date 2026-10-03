@@ -627,7 +627,26 @@ function _node_ready!(f::_EagerFill, cb::ClusterBasis)
     return cb
 end
 
-_finish_fills!(f::_EagerFill) = (foreach(fetch, f.tasks); empty!(f.tasks); f)
+# Wait for every fill task; return the first failure (or nothing).
+function _join_fills!(f::_EagerFill)
+    tasks = lock(() -> copy(f.tasks), f.lock)
+    failure = nothing
+    for t in tasks
+        try
+            wait(t)
+        catch e
+            failure === nothing && (failure = e isa TaskFailedException ? e.task.exception : e)
+        end
+    end
+    lock(() -> empty!(f.tasks), f.lock)
+    return failure
+end
+
+function _finish_fills!(f::_EagerFill)
+    failure = _join_fills!(f)
+    failure === nothing || throw(failure)
+    return f
+end
 
 function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict, threads, consume)
     rt = HMatrices.rowtree(hmat)
@@ -650,19 +669,32 @@ function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict,
     nn = length(kinds.kind)
     rctx = _BasisBuildContext(data, rtol, maxrank, true, capped, lk, kinds, spawn_min, fill, _BasisSchedule(rb, nn))
     cctx = _BasisBuildContext(data, rtol, maxrank, false, capped, lk, kinds, spawn_min, fill, _BasisSchedule(cb, nn))
+    task = nothing
     try
         if threads
             # Row and column bases are independent.
             task = Threads.@spawn _condensed_basis!(cb, nothing, cctx)
             _condensed_basis!(rb, nothing, rctx)
-            fetch(task)
+            wait(task)
         else
             _condensed_basis!(rb, nothing, rctx)
             _condensed_basis!(cb, nothing, cctx)
         end
-    catch
-        # Do not leave fill tasks running behind an error.
-        foreach(t -> (try wait(t) catch end), fill.tasks)
+    catch err
+        # Nothing may keep running (or, when consuming, keep releasing H-matrix
+        # blocks) after the error reaches the caller: stop the column-basis
+        # task (its nodes check the schedule's error before starting) and join
+        # it, then join every fill task. No task pushes fills after that.
+        if task !== nothing
+            _schedule_failed!(cctx.sched, err)
+            try
+                wait(task)
+            catch
+            end
+        end
+        _join_fills!(fill)
+        # Report a failure of the column-basis task itself, not its wrapper.
+        err isa TaskFailedException && throw(err.task.exception)
         rethrow()
     end
     _finish_fills!(fill)

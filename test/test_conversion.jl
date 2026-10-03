@@ -154,6 +154,60 @@ end
         @test H2PacketMatvecPlan(h; workers=2, consume=true)*x ≈ Matrix(H2)*x
     end
 
+    @testset "Threaded conversion error path joins every task" begin
+        # A failure in the row basis (caller task) must stop and join the
+        # column-basis task, so no H-matrix block is released after the error
+        # reaches the caller; a column-basis failure is reported unwrapped.
+        rng = MersenneTwister(936)
+        X = [Point3D(normalize(randn(rng, 3))...) for _ in 1:1500]
+        K = KernelMatrix(X, X) do x, y
+            r = norm(x - y)
+            r > 0 ? 1 / r : 0.0
+        end
+        H = assemble_hmatrix(K, ClusterTree(copy(X), GeometricSplitter(; nmax=16)),
+            ClusterTree(copy(X), GeometricSplitter(; nmax=16)); comp=PartialACA(; rtol=1e-11),
+            global_index=true, threads=false)
+        fail = Ref(:none)
+        nreleased(H) = count(l -> HMatrices.data(l) === nothing, HMatrices.leaves(H))
+        Ctx = H2Matrices._BasisBuildContext
+        @eval H2Matrices function _leaf_basis!(cb::ClusterBasis{3,Float64}, Ct, ctx::_BasisBuildContext)
+            mode = $fail[]
+            if mode !== :none
+                failing = mode === :row ? ctx.is_row : !ctx.is_row
+                failing && first(index_range(cb.cluster)) > 200 && error("injected basis failure")
+                mode === :row && !failing && sleep(0.005)    # keep the column basis busy
+            end
+            invoke(_leaf_basis!, Tuple{ClusterBasis,Any,_BasisBuildContext}, cb, Ct, ctx)
+        end
+        try
+            # Compile the overriding method and its invalidated callers first,
+            # so the failing builds run at full speed.
+            compress_hmatrix_to_h2(deepcopy(H); rtol=1e-10, maxrank=400, threads=true, consume=true,
+                                   _print=false)
+            for mode in (:row, :col)
+                Hc = deepcopy(H)
+                fail[] = mode
+                err = try
+                    compress_hmatrix_to_h2(Hc; rtol=1e-10, maxrank=400, threads=true, consume=true, _print=false)
+                    nothing
+                catch e
+                    e
+                end
+                n0 = nreleased(Hc)
+                sleep(2.0)    # an orphaned column task would finish meanwhile
+                fail[] = :none
+                @test err isa ErrorException && occursin("injected", err.msg)
+                @test nreleased(Hc) == n0
+            end
+        finally
+            fail[] = :none
+            Base.delete_method(which(H2Matrices._leaf_basis!,
+                Tuple{H2Matrices.ClusterBasis{3,Float64},Any,Ctx}))
+        end
+        @test compress_hmatrix_to_h2(deepcopy(H); rtol=1e-10, maxrank=400, threads=true,
+                                     _print=false) isa H2Matrix
+    end
+
     @testset "Saturation certificate" begin
         rng = MersenneTwister(934)
         L = Matrix(UpperTriangular(randn(rng, 40, 40))) + 10I
