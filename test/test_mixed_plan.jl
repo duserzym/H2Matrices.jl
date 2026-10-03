@@ -76,6 +76,19 @@ end
     Pall=H2MixedPacketMatvecPlan(compact;precision_rtol=1e-3);sall=precision_summary(Pall)
     @test sall.float32_rows==sall.rows && sall.rotated_packets==0 && sall.rotation_bytes==0
     @test sum(b->length(b.hi.data)+length(b.lo.data),P.nearpackets)==sum(b->length(b.D),compact.dense)
+    # Unaligned, overlapping near-field rows are split over elementary row intervals.
+    D=fill(0.03,20,10)
+    dense=vcat(compact.dense,[H2Matrices._PlanDense(D,3:22,1:10)])
+    overlap=H2CompactMatvecPlan(compact.shape,compact.rows,compact.cols,compact.couplings,dense,compact.rowcoeff,compact.colcoeff,compact.rowbuffer,compact.colbuffer,compact.rowperm,compact.colperm)
+    Mo=Matrix(C);Mo[compact.rowperm[3:22],compact.colperm[1:10]].+=D
+    for workers in (1,4),rtol in (0.,1e-8)
+        Po=H2MixedPacketMatvecPlan(overlap;workers,precision_rtol=rtol);so=precision_summary(Po)
+        x=randn(rng,257);z=randn(rng,331)
+        @test norm(Po*x-Mo*x) <= so.bound*norm(x)+1e-13*opnorm(Mo)*norm(x)
+        @test norm(adjoint(Po)*z-Mo'*z) <= so.bound*norm(z)+1e-13*opnorm(Mo)*norm(z)
+        rows=sort([b.row for b in Po.nearpackets];by=first)
+        @test all(last(rows[i])<first(rows[i+1]) for i in 1:length(rows)-1)
+    end
     @test_throws ArgumentError H2MixedPacketMatvecPlan(compact;workers=0)
     @test_throws ArgumentError H2MixedPacketMatvecPlan(compact;precision_rtol=-1.)
     @test_throws ArgumentError H2MixedPacketMatvecPlan(compact;precision_rtol=NaN)

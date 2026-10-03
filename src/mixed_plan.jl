@@ -279,26 +279,30 @@ function _precision_selection(om2, Ns, explicit, beta2, delta2)
     r2
 end
 
-# Dense near-field blocks regrouped by leaf row ranges, so that near packets
-# write disjoint output rows (rows of blocks with a non-leaf row cluster are
-# split exactly into the leaf row slices).
+# Dense near-field blocks regrouped over the elementary row intervals induced
+# by all block row ranges and leaf clusters (the leaves themselves for
+# cluster-aligned blocks), so near packets write disjoint output rows. Blocks
+# are split exactly into row slices.
 function _leaf_near_groups(p::H2CompactMatvecPlan)
-    leaves = sort!([n.indices for n in p.rows if isempty(n.children) && !isempty(n.indices)]; by=first)
-    firsts = first.(leaves)
+    cuts = Int[]
+    for n in p.rows
+        isempty(n.children) && !isempty(n.indices) && push!(cuts, first(n.indices), last(n.indices) + 1)
+    end
+    for b in p.dense
+        isempty(b.rows) || push!(cuts, first(b.rows), last(b.rows) + 1)
+    end
+    sort!(unique!(cuts))
     groups = Dict{UnitRange{Int},Vector{Tuple{Int,UnitRange{Int}}}}(); order = UnitRange{Int}[]
     for (i, b) in enumerate(p.dense)
-        R = b.rows; isempty(R) && continue
-        l = searchsortedfirst(firsts, first(R))
-        while l <= length(leaves) && last(leaves[l]) <= last(R)
-            L = leaves[l]
+        R = b.rows; (isempty(R) || isempty(b.cols)) && continue
+        c = searchsortedfirst(cuts, first(R))
+        while c < length(cuts) && cuts[c] <= last(R)
+            L = cuts[c]:cuts[c+1]-1
             haskey(groups, L) || (groups[L] = Tuple{Int,UnitRange{Int}}[]; push!(order, L))
             push!(groups[L], (i, L .- (first(R) - 1)))
-            l += 1
+            c += 1
         end
     end
-    covered = sum((length(L) * sum(length(p.dense[i].cols) for (i, _) in groups[L]) for L in order); init=0)
-    covered == sum((length(b.D) for b in p.dense); init=0) ||
-        throw(ArgumentError("near-field row ranges do not align with leaf clusters"))
     groups, order
 end
 
@@ -344,6 +348,9 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
     r2 = rot ? _precision_selection(om2, Ns, explicitU, beta2, (precision_rtol * eta)^2) : zeros(Int, np)
     # A packet stored entirely in Float32 needs no rotation.
     rotated = [0 < r2[t] < ks[t] for t in 1:np]
+    for t in 1:np
+        rotated[t] || (Us[t] = zeros(0, 0))     # release unused pass-1 rotations early
+    end
     absorbed = Dict{Int,Matrix{Float64}}(order[t] => Us[t] for t in 1:nf if rotated[t] && !explicitU[t])
     rows = copy(p.rows)
     if !isempty(absorbed)
