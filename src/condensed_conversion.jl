@@ -262,6 +262,15 @@ end
 # they are materialized only at the end, after consumed H blocks are released.
 const _DEFERRED_TRANSFER = zeros(Float64, 0, 0)
 
+# R of Pt = Q*R when Pt is taller than wide (same singular values and right
+# singular vectors), otherwise Pt itself.
+function _square_factor!(Pt::Matrix{Float64})
+    w, n = size(Pt)
+    w <= n && return Pt
+    LAPACK.geqrt!(Pt, Matrix{Float64}(undef, min(36, n), n))
+    return triu!(Pt[1:n, 1:n])
+end
+
 function _mark_identity_embedding!(cb::ClusterBasis, kc::Int, kinds::_ConversionBases)
     cb.k = kc
     for child in cb.children
@@ -302,8 +311,9 @@ function _transfer_basis!(cb::ClusterBasis, Lt, triangular::Bool, ctx::_BasisBui
         _rproject_into!(view(Pt, :, (off+1):(off+child.k)), child, view(Lt, :, _local_rows(child, irange)), kinds)
         off += child.k
     end
-    # Left singular vectors of the projected active set = right ones of Pt.
-    F = svd!(Pt)
+    # Left singular vectors of the projected active set = right ones of Pt,
+    # which a tall Pt shares with its triangular QR factor (cheaper SVD).
+    F = svd!(_square_factor!(Pt))
     k = _truncation_rank(F.S, ctx.rtol, ctx.maxrank)
     _record_rank_cap!(ctx, F.S, k)
     if k == 0
