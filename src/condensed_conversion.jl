@@ -451,6 +451,12 @@ function _fill_leaf!(h2::H2Matrix, hmat::HMatrix, kinds::_ConversionBases, consu
     return nothing
 end
 
+# Bytes a consuming fill adds (coupling) minus those it releases (factors).
+function _fill_net_bytes(h::H2Matrix, hm::HMatrix)
+    HMatrices.isadmissible(hm) || return 0
+    return 8 * h.row_basis.k * h.col_basis.k - _hblock_bytes(HMatrices.data(hm))
+end
+
 function _fill_h2_condensed!(h2::H2Matrix, hmat::HMatrix, kinds::_ConversionBases;
                              threads::Bool, consume::Bool)
     pairs = _leaf_pairs!(Tuple{typeof(h2),typeof(hmat)}[], h2, hmat)
@@ -462,9 +468,12 @@ function _fill_h2_condensed!(h2::H2Matrix, hmat::HMatrix, kinds::_ConversionBase
             _fill_leaf!(h, hm, kinds, consume, tracker)
         end
     else
-        # Largest blocks first for load balance; each block is independent, so
-        # the result does not depend on scheduling.
-        order = sortperm([length(h.row_basis) * length(h.col_basis) for (h, _) in pairs]; rev=true)
+        # Each block is independent, so the result does not depend on the order.
+        # Largest blocks first balances load; when consuming, blocks that free
+        # the most memory (ACA factors larger than the coupling) go first so the
+        # heap shrinks before it grows.
+        order = consume ? sortperm([_fill_net_bytes(h, hm) for (h, hm) in pairs]) :
+            sortperm([length(h.row_basis) * length(h.col_basis) for (h, _) in pairs]; rev=true)
         next = Threads.Atomic{Int}(1)
         tasks = map(1:ntasks) do _
             Threads.@spawn begin
