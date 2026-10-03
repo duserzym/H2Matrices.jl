@@ -271,6 +271,12 @@ end
                 @test norm(adjoint(A)*z-Ms'*z)/norm(Ms'*z)<1e-8
             end
             @test Ps*x ≈ Fs*x rtol=1e-13
+            # Scaled factors in products with several right-hand sides.
+            Y=Ps*X;W=adjoint(Ps)*Z
+            for v in axes(X,2)
+                @test Y[:,v] ≈ Ps*X[:,v] rtol=1e-13
+                @test W[:,v] ≈ adjoint(Ps)*Z[:,v] rtol=1e-13
+            end
         end
     end
 end
