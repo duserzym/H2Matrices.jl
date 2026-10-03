@@ -489,6 +489,8 @@ end
 # is therefore filled (and, when consuming, its ACA factors released) by the
 # task that completes the second of its two nodes, overlapping the fill with
 # the remaining basis work. The result does not depend on the schedule.
+# With threads, the couplings that become ready at a node are filled by a
+# separate task, so large top-level fills stay off the basis critical path.
 struct _EagerFill{P,K,T}
     pairs::Vector{P}
     lists::Vector{Vector{Int}}           # by node index: pairs of that node
@@ -496,28 +498,45 @@ struct _EagerFill{P,K,T}
     kinds::K
     consume::Bool
     tracker::T
+    spawn::Bool
+    tasks::Vector{Task}
+    lock::ReentrantLock
 end
 
-function _EagerFill(pairs::Vector{P}, kinds::_ConversionBases, consume::Bool, tracker) where {P}
+function _EagerFill(pairs::Vector{P}, kinds::_ConversionBases, consume::Bool, tracker, spawn::Bool) where {P}
     lists = [Int[] for _ in 1:length(kinds.kind)]
     for (p, (h, _)) in enumerate(pairs)
         push!(lists[kinds.index[h.row_basis]], p)
         push!(lists[kinds.index[h.col_basis]], p)
     end
     pending = [Threads.Atomic{Int}(2) for _ in pairs]
-    return _EagerFill(pairs, lists, pending, kinds, consume, tracker)
+    return _EagerFill(pairs, lists, pending, kinds, consume, tracker, spawn, Task[], ReentrantLock())
+end
+
+function _fill_pairs!(f::_EagerFill, ready::Vector{Int})
+    for p in ready
+        h, hm = f.pairs[p]
+        _fill_leaf!(h, hm, f.kinds, f.consume, f.tracker)
+    end
 end
 
 _node_ready!(::Nothing, cb) = cb
 function _node_ready!(f::_EagerFill, cb::ClusterBasis)
+    ready = Int[]
     for p in f.lists[f.kinds.index[cb]]
-        if Threads.atomic_sub!(f.pending[p], 1) == 1
-            h, hm = f.pairs[p]
-            _fill_leaf!(h, hm, f.kinds, f.consume, f.tracker)
-        end
+        Threads.atomic_sub!(f.pending[p], 1) == 1 && push!(ready, p)
+    end
+    isempty(ready) && return cb
+    if f.spawn
+        task = Threads.@spawn _fill_pairs!(f, ready)
+        lock(() -> push!(f.tasks, task), f.lock)
+    else
+        _fill_pairs!(f, ready)
     end
     return cb
 end
+
+_finish_fills!(f::_EagerFill) = (foreach(fetch, f.tasks); empty!(f.tasks); f)
 
 function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict, threads, consume)
     rt = HMatrices.rowtree(hmat)
@@ -533,21 +552,28 @@ function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict,
     data = _collect_rk_entries(admissible, kinds)
     tracker = consume ?
         _ReleaseTracker(sum((_hblock_bytes(HMatrices.data(hm)) for (_, hm) in admissible); init=0)) : nothing
-    fill = _EagerFill(admissible, kinds, consume, tracker)
+    fill = _EagerFill(admissible, kinds, consume, tracker, threads)
     capped = Float64[]
     lk = ReentrantLock()
     spawn_min = _condensed_spawn_min(threads)
     rctx = _BasisBuildContext(data, rtol, maxrank, true, capped, lk, kinds, spawn_min, fill)
     cctx = _BasisBuildContext(data, rtol, maxrank, false, capped, lk, kinds, spawn_min, fill)
-    if threads
-        # Row and column bases are independent.
-        task = Threads.@spawn _condensed_basis!(cb, nothing, cctx)
-        _condensed_basis!(rb, nothing, rctx)
-        fetch(task)
-    else
-        _condensed_basis!(rb, nothing, rctx)
-        _condensed_basis!(cb, nothing, cctx)
+    try
+        if threads
+            # Row and column bases are independent.
+            task = Threads.@spawn _condensed_basis!(cb, nothing, cctx)
+            _condensed_basis!(rb, nothing, rctx)
+            fetch(task)
+        else
+            _condensed_basis!(rb, nothing, rctx)
+            _condensed_basis!(cb, nothing, cctx)
+        end
+    catch
+        # Do not leave fill tasks running behind an error.
+        foreach(t -> (try wait(t) catch end), fill.tasks)
+        rethrow()
     end
+    _finish_fills!(fill)
     if !isempty(capped)
         message = "H2 basis rank cap prevents the requested local tolerance at $(length(capped)) clusters; largest relative discarded singular value = $(maximum(capped)). Increase maxrank."
         strict ? throw(ArgumentError(message)) : (@warn message)
