@@ -257,8 +257,16 @@ function _certified_full_rank(R::AbstractMatrix{Float64}, rtol::Float64)
     return inv(ni * nf) > 16 * max(rtol, size(R, 1) * eps(Float64))
 end
 
+# Identity-embedding transfers are dense selection matrices that the builder
+# and coupling fill never read (identity nodes are projected by stacking), so
+# they are materialized only at the end, after consumed H blocks are released.
+const _DEFERRED_TRANSFER = zeros(Float64, 0, 0)
+
 function _mark_identity_embedding!(cb::ClusterBasis, kc::Int, kinds::_ConversionBases)
-    _set_identity_embedding!(cb, nothing, kc)
+    cb.k = kc
+    for child in cb.children
+        child.E = _DEFERRED_TRANSFER
+    end
     i = kinds.index[cb]
     kinds.kind[i] = _BASIS_IDENTITY
     kinds.full[i] = all(child -> _full_identity(kinds, child), cb.children)
@@ -338,6 +346,15 @@ function _condensed_basis!(cb::ClusterBasis, inherited_t, ctx::_BasisBuildContex
         end
     end
     return _transfer_basis!(cb, Lt, triangular, ctx)
+end
+
+function _materialize_identity_embeddings!(root::ClusterBasis, kinds::_ConversionBases)
+    for cb in nodes(root)
+        if !isleaf(cb) && kinds.kind[kinds.index[cb]] == _BASIS_IDENTITY
+            _set_identity_embedding!(cb, nothing, cb.k)
+        end
+    end
+    return root
 end
 
 _conversion_threads_default() = Threads.nthreads() > 1 && BLAS.get_num_threads() == 1
@@ -496,5 +513,7 @@ function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict,
     end
     h2 = _mirror_hmat_to_h2(hmat, row_map, col_map)
     _fill_h2_condensed!(h2, hmat, kinds; threads, consume)
+    _materialize_identity_embeddings!(rb, kinds)
+    _materialize_identity_embeddings!(cb, kinds)
     return h2
 end

@@ -320,7 +320,7 @@ function _build_adaptive_basis_recursive!(
     ctx = _BasisBuildContext(data, rtol, maxrank, is_row, capped_residuals, ReentrantLock(),
                              kinds, _condensed_spawn_min(threads))
     _condensed_basis!(cb, seed, ctx)
-    return cb
+    return _materialize_identity_embeddings!(cb, kinds)
 end
 
 function _record_rank_cap!(residuals, singular_values, k, rtol, maxrank)
