@@ -1,14 +1,20 @@
 @testset "Interleaved row storage and kernels" begin
     rng=MersenneTwister(77)
-    for rows in 0:9, T in (Float64,Float32)
-        A=randn(rng,rows,13);S=H2Matrices._InterleavedRows{T}(A)
-        @test Matrix(S)==T.(A)
+    for rows in 0:9, T in (Float64,Float32,H2Matrices._T48)
+        A=randn(rng,rows,13).*exp10.(rand(rng,-8:2,rows,13));S=H2Matrices._InterleavedRows{T}(A)
+        D=Float64.(Matrix(S))
+        if T===H2Matrices._T48
+            @test all(abs.(D.-A) .<= H2Matrices._U48 .* abs.(A))
+            @test D!=A || rows==0
+        else
+            @test Matrix(S)==T.(A)
+        end
         x=randn(rng,13);z=randn(rng,rows+2);z0=copy(z)
         H2Matrices._il_forward!(z,1,S,x)
-        @test z ≈ z0+[0;Float64.(T.(A))*x;0] rtol=1e-14 atol=1e-14
+        @test z ≈ z0+[0;D*x;0] rtol=1e-14 atol=1e-14
         w=randn(rng,rows+3);y=randn(rng,13);y0=copy(y)
         H2Matrices._il_adjoint!(y,S,w,2)
-        @test y ≈ y0+Float64.(T.(A))'*w[3:rows+2] rtol=1e-14 atol=1e-14
+        @test y ≈ y0+D'*w[3:rows+2] rtol=1e-14 atol=1e-14
     end
     # Householder rotations: forward and transposed application are inverse transposes.
     k=11;r=6;U=Matrix(qr(randn(rng,k,k)).Q)
@@ -36,8 +42,10 @@ end
     for gi in (true,false)
         C.global_index=gi;compact=H2CompactMatvecPlan(C);M=Matrix(C;global_index=gi)
         P0=H2PacketMatvecPlan(compact)
-        for rtol in (0.,1e-13,1e-8,1e-4),workers in (1,4)
-            P=H2MixedPacketMatvecPlan(compact;workers,precision_rtol=rtol);s=precision_summary(P)
+        for rtol in (0.,1e-13,1e-8,1e-4),workers in (1,4),f48 in (false,true)
+            P=H2MixedPacketMatvecPlan(compact;workers,precision_rtol=rtol,format48=f48);s=precision_summary(P)
+            f48 || @test s.float48_rows==0
+            f48 && rtol==1e-13 && @test s.float48_rows>0 && storage_bytes(P)<storage_bytes(H2MixedPacketMatvecPlan(compact;precision_rtol=rtol))
             @test !(:h2 in fieldnames(typeof(P)))
             @test s.bound <= rtol*s.reference_norm*(1+1e-12)
             @test s.storage_perturbation <= s.bound*(1+1e-12)
@@ -60,7 +68,7 @@ end
             @test abs(dot(z,P*x)-dot(adjoint(P)*z,x)) <= 1e-13*norm(z)*norm(P*x)
             Q=copy(P)
             @test Q.rowcoeff!==P.rowcoeff && Q.partials[1]!==P.partials[1]
-            @test all(b.hi===c.hi && b.lo===c.lo && b.hv===c.hv && b.scratch!==c.scratch for (b,c) in zip(P.packets,Q.packets))
+            @test all(b.hi===c.hi && b.mid===c.mid && b.lo===c.lo && b.hv===c.hv && b.scratch!==c.scratch for (b,c) in zip(P.packets,Q.packets))
             @test all(b.hi===c.hi && b.scratch!==c.scratch for (b,c) in zip(P.nearpackets,Q.nearpackets))
             f=Threads.@spawn P*x
             g=Threads.@spawn adjoint(Q)*z
@@ -75,7 +83,7 @@ end
     # A large budget stores every packet in Float32 without rotations.
     Pall=H2MixedPacketMatvecPlan(compact;precision_rtol=1e-3);sall=precision_summary(Pall)
     @test sall.float32_rows==sall.rows && sall.rotated_packets==0 && sall.rotation_bytes==0
-    @test sum(b->length(b.hi.data)+length(b.lo.data),P.nearpackets)==sum(b->length(b.D),compact.dense)
+    @test sum(b->length(b.hi.data)+length(b.mid.data.hi)+length(b.lo.data),P.nearpackets)==sum(b->length(b.D),compact.dense)
     # Unaligned, overlapping near-field rows are split over elementary row intervals.
     D=fill(0.03,20,10)
     dense=vcat(compact.dense,[H2Matrices._PlanDense(D,3:22,1:10)])
@@ -99,6 +107,10 @@ end
     if VERSION>=v"1.10"
         @test allocations(P,randn(rng,257),zeros(331))==0
         @test allocations(adjoint(P),randn(rng,331),zeros(257))==0
+        P48=H2MixedPacketMatvecPlan(compact;precision_rtol=1e-13,format48=true)
+        @test precision_summary(P48).float48_rows>0
+        @test allocations(P48,randn(rng,257),zeros(331))==0
+        @test allocations(adjoint(P48),randn(rng,331),zeros(257))==0
     end
 end
 @testset "Mixed-precision rotations absorbed into explicit bases" begin
@@ -113,8 +125,8 @@ end
     C=compress_hmatrix_to_h2(H;rtol=1e-10,maxrank=600,strict=true,_print=false)
     compact=H2CompactMatvecPlan(C);M=Matrix(C)
     @test any(n->!n.identity && !isempty(n.coeff),compact.rows)
-    for rtol in (1e-10,1e-8),workers in (1,3)
-        P=H2MixedPacketMatvecPlan(compact;workers,precision_rtol=rtol);s=precision_summary(P)
+    for rtol in (1e-10,1e-8),workers in (1,3),f48 in (false,true)
+        P=H2MixedPacketMatvecPlan(compact;workers,precision_rtol=rtol,format48=f48);s=precision_summary(P)
         @test s.absorbed_rotations>0
         @test s.bound <= rtol*s.reference_norm*(1+1e-12)
         x=randn(rng,600);z=randn(rng,600)

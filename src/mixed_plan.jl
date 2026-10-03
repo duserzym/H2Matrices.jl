@@ -14,50 +14,76 @@
 
 const _U32 = Float64(eps(Float32)) / 2      # unit roundoff of Float32 rounding to nearest
 
+const _U48 = 2.0^-37                        # unit roundoff of the 48-bit format below
+
+# Optional 48-bit format: a Float64 truncated to sign, exponent and 36 mantissa
+# bits (round to nearest), stored as a UInt32 plane and a UInt16 plane.
+struct _T48 end
+struct _Planes48
+    hi::Vector{UInt32}
+    lo::Vector{UInt16}
+end
+_storage(::Type{T}, n) where {T<:Union{Float32,Float64}} = Vector{T}(undef, n)
+_storage(::Type{_T48}, n) = _Planes48(Vector{UInt32}(undef, n), Vector{UInt16}(undef, n))
+Base.@propagate_inbounds _put!(d::Vector{T}, q, v) where {T} = (d[q] = T(v); nothing)
+Base.@propagate_inbounds function _put!(d::_Planes48, q, v)
+    u = (reinterpret(UInt64, Float64(v)) + 0x0000_0000_0000_8000) & 0xffff_ffff_ffff_0000
+    d.hi[q] = UInt32(u >> 32); d.lo[q] = UInt16((u >> 16) & 0xffff)
+    nothing
+end
+Base.@propagate_inbounds _ld(d::Vector{T}, q) where {T} = Float64(d[q])
+Base.@propagate_inbounds _ld(d::_Planes48, q) = reinterpret(Float64, (UInt64(d.hi[q]) << 32) | (UInt64(d.lo[q]) << 16))
+_nbytes(d::Vector) = sizeof(d)
+_nbytes(d::_Planes48) = sizeof(d.hi) + sizeof(d.lo)
+
 # Row-interleaved storage of a dense `rows x N` matrix: groups of four rows are
 # stored column-interleaved (`data[4N*g+4(j-1)+q] = A[4g+q,j]`), and the trailing
 # `rows % 4` rows follow, each contiguous.
-struct _InterleavedRows{T<:Union{Float32,Float64}}
-    data::Vector{T}
+struct _InterleavedRows{T,D}
+    data::D
     rows::Int
     N::Int
 end
+const _Rows64 = _InterleavedRows{Float64,Vector{Float64}}
+const _Rows48 = _InterleavedRows{_T48,_Planes48}
+const _Rows32 = _InterleavedRows{Float32,Vector{Float32}}
 function _InterleavedRows{T}(A::AbstractMatrix) where {T}
-    rows, N = size(A); data = Vector{T}(undef, rows * N); g4 = rows ÷ 4
+    rows, N = size(A); data = _storage(T, rows * N); g4 = rows ÷ 4
     @inbounds for g in 0:g4-1, j in 1:N, q in 1:4
-        data[4N*g+4(j-1)+q] = T(A[4g+q, j])
+        _put!(data, 4N*g+4(j-1)+q, A[4g+q, j])
     end
     @inbounds for r in 1:rows%4, j in 1:N
-        data[4N*g4+N*(r-1)+j] = T(A[4g4+r, j])
+        _put!(data, 4N*g4+N*(r-1)+j, A[4g4+r, j])
     end
-    _InterleavedRows{T}(data, rows, N)
+    _InterleavedRows{T,typeof(data)}(data, rows, N)
 end
-function Base.Matrix(A::_InterleavedRows{T}) where {T}
-    M = Matrix{T}(undef, A.rows, A.N); N = A.N; g4 = A.rows ÷ 4
+_eltype(::_InterleavedRows{T}) where {T} = T === _T48 ? Float64 : T
+function Base.Matrix(A::_InterleavedRows)
+    M = Matrix{_eltype(A)}(undef, A.rows, A.N); N = A.N; g4 = A.rows ÷ 4
     for g in 0:g4-1, j in 1:N, q in 1:4
-        M[4g+q, j] = A.data[4N*g+4(j-1)+q]
+        M[4g+q, j] = _ld(A.data, 4N*g+4(j-1)+q)
     end
     for r in 1:A.rows%4, j in 1:N
-        M[4g4+r, j] = A.data[4N*g4+N*(r-1)+j]
+        M[4g4+r, j] = _ld(A.data, 4N*g4+N*(r-1)+j)
     end
     M
 end
-@inline function _il_fwd4!(z, zo, d::Vector{T}, o, N, x) where {T}
+@inline function _il_fwd4!(z, zo, d, o, N, x)
     s1 = 0.0; s2 = 0.0; s3 = 0.0; s4 = 0.0
     @inbounds @simd for j in 1:N
         xj = x[j]; q = o + 4(j - 1)
-        s1 = muladd(Float64(d[q+1]), xj, s1); s2 = muladd(Float64(d[q+2]), xj, s2)
-        s3 = muladd(Float64(d[q+3]), xj, s3); s4 = muladd(Float64(d[q+4]), xj, s4)
+        s1 = muladd(_ld(d, q+1), xj, s1); s2 = muladd(_ld(d, q+2), xj, s2)
+        s3 = muladd(_ld(d, q+3), xj, s3); s4 = muladd(_ld(d, q+4), xj, s4)
     end
     @inbounds begin
         z[zo+1] += s1; z[zo+2] += s2; z[zo+3] += s3; z[zo+4] += s4
     end
     nothing
 end
-@inline function _il_fwd1!(z, zo, d::Vector{T}, o, N, x) where {T}
+@inline function _il_fwd1!(z, zo, d, o, N, x)
     s = 0.0
     @inbounds @simd for j in 1:N
-        s = muladd(Float64(d[o+j]), x[j], s)
+        s = muladd(_ld(d, o+j), x[j], s)
     end
     @inbounds z[zo+1] += s
     nothing
@@ -73,17 +99,17 @@ function _il_forward!(z::Vector{Float64}, zo::Int, A::_InterleavedRows, x::Vecto
     end
     nothing
 end
-@inline function _il_adj4!(x, d::Vector{T}, o, N, w, wo) where {T}
+@inline function _il_adj4!(x, d, o, N, w, wo)
     @inbounds w1 = w[wo+1]; @inbounds w2 = w[wo+2]; @inbounds w3 = w[wo+3]; @inbounds w4 = w[wo+4]
     @inbounds @simd for j in 1:N
         q = o + 4(j - 1)
-        x[j] += muladd(Float64(d[q+1]), w1, Float64(d[q+2]) * w2) + muladd(Float64(d[q+3]), w3, Float64(d[q+4]) * w4)
+        x[j] += muladd(_ld(d, q+1), w1, _ld(d, q+2) * w2) + muladd(_ld(d, q+3), w3, _ld(d, q+4) * w4)
     end
     nothing
 end
-@inline function _il_adj1!(x, d::Vector{T}, o, N, wi) where {T}
+@inline function _il_adj1!(x, d, o, N, wi)
     @inbounds @simd for j in 1:N
-        x[j] = muladd(Float64(d[o+j]), wi, x[j])
+        x[j] = muladd(_ld(d, o+j), wi, x[j])
     end
     nothing
 end
@@ -103,8 +129,9 @@ end
 struct _MixedPacket
     row::UnitRange{Int}
     columns::Vector{UnitRange{Int}}
-    hi::_InterleavedRows{Float64}
-    lo::_InterleavedRows{Float32}
+    hi::_Rows64
+    mid::_Rows48
+    lo::_Rows32
     # Explicit packet rotation Q = H_1 ⋯ H_r as Householder reflectors (empty if
     # none or absorbed into the row basis): reflector i is [1; hv[off_i+1:off_i+k-i]].
     hv::Vector{Float64}
@@ -112,8 +139,8 @@ struct _MixedPacket
     scratch::Vector{Float64}
     zbuf::Vector{Float64}
 end
-_copy_packet(b::_MixedPacket) = _MixedPacket(b.row, b.columns, b.hi, b.lo, b.hv, b.tau, zeros(length(b.scratch)), zeros(length(b.zbuf)))
-_packet_bytes(b::_MixedPacket) = sizeof(b.hi.data) + sizeof(b.lo.data) + sizeof(b.hv) + sizeof(b.tau)
+_copy_packet(b::_MixedPacket) = _MixedPacket(b.row, b.columns, b.hi, b.mid, b.lo, b.hv, b.tau, zeros(length(b.scratch)), zeros(length(b.zbuf)))
+_packet_bytes(b::_MixedPacket) = _nbytes(b.hi.data) + _nbytes(b.mid.data) + _nbytes(b.lo.data) + sizeof(b.hv) + sizeof(b.tau)
 # Stored Float64 entries of r Householder reflectors of a k-row rotation.
 _reflector_entries(k, r) = r * k - (r * (r + 1)) ÷ 2
 @inline function _reflect!(z, hv, off, i, k, τ)
@@ -146,8 +173,8 @@ function _apply_reflectors!(z::Vector{Float64}, hv::Vector{Float64}, tau::Vector
 end
 
 """
-    H2MixedPacketMatvecPlan(compact_plan; workers=1, precision_rtol=1e-13)
-    H2MixedPacketMatvecPlan(h2; workers=1, precision_rtol=1e-13)
+    H2MixedPacketMatvecPlan(compact_plan; workers=1, precision_rtol=1e-13, format48=false)
+    H2MixedPacketMatvecPlan(h2; workers=1, precision_rtol=1e-13, format48=false)
 
 Packet plan with adaptive mixed-precision storage. Far-field packets hold all
 couplings of one row node, as in `H2PacketMatvecPlan`. Near-field packets hold
@@ -162,10 +189,16 @@ stored transfers and leaf bases, so they cost no storage. For implicit
 (saturated) or physical rows, `Q` is stored as the `k - r` Householder
 reflectors that span the `r` Float64 rows. That cost enters the selection.
 
+With `format48=true`, rows of intermediate weight can also use a 48-bit format:
+a Float64 rounded to 36 mantissa bits (unit roundoff `u₄₈ = 2⁻³⁷`), stored as
+a UInt32 plane plus a UInt16 plane. This lowers storage further, but its
+decode makes those rows slower to stream than Float64 rows on CPUs where a
+few workers already saturate memory bandwidth.
+
 A global Lagrangian allocation picks the rows. It minimizes stored bytes
 subject to the a priori bound
 
-    ‖Ã - A‖₂ ≤ ‖Ã - A‖_F ≤ (Σ_t β_t² Σ_{i∈lo(t)} (u₃₂² ω_i² + N_t 2⁻³⁰⁰))^{1/2} ≤ precision_rtol · η.
+    ‖Ã - A‖₂ ≤ ‖Ã - A‖_F ≤ (Σ_t β_t² [Σ_{i∈f32(t)} (u₃₂² ω_i² + N_t 2⁻³⁰⁰) + Σ_{i∈f48(t)} u₄₈² ω_i²])^{1/2} ≤ precision_rtol · η.
 
 Here `A` is the Float64 compact operator and `Ã` the stored mixed operator,
 both in exact arithmetic, and `u₃₂ = 2⁻²⁴`. `β_t` is the product of the row-
@@ -237,26 +270,38 @@ function _lpt_schedule(costs::Vector{Float64}, workers::Int)
     owner
 end
 
-# Bytes saved and bound cost for storing the r2 trailing rows of a packet in Float32.
-# Explicit rotations store the reflectors spanning the r1 = k-r2 Float64 rows;
-# any orthonormal basis of their complement gives the same Float32 cost.
-function _best_split(om2::Vector{Float64}, N::Int, explicit::Bool, beta2::Float64, mu::Float64)
-    k = length(om2); best = 0.0; bestr = 0; c = 0.0; bestc = 0.0
-    for r2 in 1:k
-        c += beta2 * (_U32^2 * om2[k-r2+1] + N * 2.0^-300)
-        ucost = explicit ? 8.0 * (_reflector_entries(k, k - r2) + (k - r2)) : 0.0
-        f = 4.0 * r2 * N - ucost - mu * c
+# Rows sorted by decreasing weight are stored as Float64 rows 1:m₄₈, optional
+# 48-bit rows m₄₈+1:m and Float32 rows m+1:k. For multiplier mu this returns the
+# split (r32 = k-m, r48 = m-m₄₈) maximizing saved bytes - mu*cost and its cost.
+# An explicit rotation stores the reflectors spanning the rows above the last
+# format boundary; any orthonormal basis of the remaining complement gives the
+# same rounding cost, because the cost depends only on the subspaces.
+function _best_split(om2::Vector{Float64}, N::Int, explicit::Bool, beta2::Float64, mu::Float64, use48::Bool)
+    k = length(om2)
+    m48 = use48 ? count(w -> 2.0 * N <= mu * beta2 * _U48^2 * w, om2) : k   # rows that prefer Float64 over 48-bit
+    p48 = zeros(k + 1)
+    for i in 1:k
+        p48[i+1] = p48[i] + beta2 * _U48^2 * om2[i]
+    end
+    best = 0.0; bestr = (0, 0); bestc = 0.0; c32 = 0.0
+    for r32 in 0:k
+        r32 > 0 && (c32 += beta2 * (_U32^2 * om2[k-r32+1] + N * 2.0^-300))
+        m = k - r32; mm = min(m48, m); n48 = m - mm
+        (r32 == 0 && n48 == 0) && continue
+        nref = r32 > 0 ? m : (mm < k ? mm : 0)
+        c = c32 + p48[m+1] - p48[mm+1]
+        f = 4.0 * r32 * N + 2.0 * n48 * N - (explicit ? 8.0 * (_reflector_entries(k, nref) + nref) : 0.0) - mu * c
         if f > best
-            best = f; bestr = r2; bestc = c
+            best = f; bestr = (r32, n48); bestc = c
         end
     end
     bestr, bestc
 end
 # Smallest Lagrange multiplier whose per-packet selections meet the squared budget.
-function _precision_selection(om2, Ns, explicit, beta2, delta2)
-    np = length(om2); r2 = zeros(Int, np)
-    delta2 > 0 || return r2
-    total(mu) = sum(_best_split(om2[t], Ns[t], explicit[t], beta2[t], mu)[2] for t in 1:np; init=0.0)
+function _precision_selection(om2, Ns, explicit, beta2, delta2, use48)
+    np = length(om2); r32 = zeros(Int, np); r48 = zeros(Int, np)
+    delta2 > 0 || return r32, r48
+    total(mu) = sum(_best_split(om2[t], Ns[t], explicit[t], beta2[t], mu, use48)[2] for t in 1:np; init=0.0)
     mu = 0.0
     if total(0.0) > delta2
         mu = 1.0
@@ -274,9 +319,9 @@ function _precision_selection(om2, Ns, explicit, beta2, delta2)
         end
     end
     for t in 1:np
-        r2[t] = _best_split(om2[t], Ns[t], explicit[t], beta2[t], mu)[1]
+        r32[t], r48[t] = _best_split(om2[t], Ns[t], explicit[t], beta2[t], mu, use48)[1]
     end
-    r2
+    r32, r48
 end
 
 # Dense near-field blocks regrouped over the elementary row intervals induced
@@ -306,7 +351,7 @@ function _leaf_near_groups(p::H2CompactMatvecPlan)
     groups, order
 end
 
-function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precision_rtol::Real=1e-13)
+function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precision_rtol::Real=1e-13, format48::Bool=false)
     workers > 0 || throw(ArgumentError("workers must be positive"))
     isfinite(precision_rtol) && precision_rtol >= 0 || throw(ArgumentError("precision_rtol must be finite and nonnegative"))
     groups = Dict{Int,Vector{Int}}(); order = Int[]
@@ -332,26 +377,54 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
     beta2 = [t <= nf ? (rownorm[order[t]] * maximum(colnorm[p.couplings[i].col] for i in groups[order[t]]))^2 : 1.0 for t in 1:np]
     # Rotations of explicit far-field row bases are absorbed; implicit and physical rows store U.
     explicitU = [t > nf || p.rows[order[t]].identity for t in 1:np]
-    # Pass 1: rotation and row weights of every packet (packet matrices are temporary).
-    Us = Vector{Matrix{Float64}}(undef, np); om2 = [Float64[] for _ in 1:np]; fro2 = zeros(np)
+    # Pass 1: squared row weights ω² (Gram eigenvalues, padded by an eigensolver
+    # error estimate) of every packet; packet matrices are temporary. Only the
+    # selection uses these weights; the reported bound uses the stored rows.
+    om2 = [Float64[] for _ in 1:np]; fro2 = zeros(np)
     rot = precision_rtol > 0
+    gram_eig(M) = eigen(Symmetric(M * M'); alg=LinearAlgebra.DivideAndConquer())
     Threads.@threads :dynamic for t in 1:np
         M = packet_matrix(t); fro2[t] = sum(abs2, M)
         if rot
-            # Eigenvectors of the Gram matrix give the left singular basis; only
-            # the selection uses these weights, the bound uses the stored rows.
-            F = eigen(Symmetric(M * M'); alg=LinearAlgebra.DivideAndConquer())
-            Us[t] = F.vectors[:, end:-1:1]; om2[t] = max.(F.values[end:-1:1], 0.0)
+            λ = eigvals(Symmetric(M * M'); alg=LinearAlgebra.DivideAndConquer())
+            om2[t] = max.(λ[end:-1:1], 0.0) .+ length(λ) * eps() * max(λ[end], 0.0)
         end
     end
     eta = sqrt(sum(fro2; init=0.0))
-    r2 = rot ? _precision_selection(om2, Ns, explicitU, beta2, (precision_rtol * eta)^2) : zeros(Int, np)
-    # A packet stored entirely in Float32 needs no rotation.
-    rotated = [0 < r2[t] < ks[t] for t in 1:np]
-    for t in 1:np
-        rotated[t] || (Us[t] = zeros(0, 0))     # release unused pass-1 rotations early
+    r32, r48 = rot ? _precision_selection(om2, Ns, explicitU, beta2, (precision_rtol * eta)^2, format48) : (zeros(Int, np), zeros(Int, np))
+    n64 = ks .- r32 .- r48
+    # A packet stored in a single format needs no rotation.
+    rotated = [count(>(0), (n64[t], r48[t], r32[t])) > 1 for t in 1:np]
+    # Pass 2: rotated packets split into Float64, optional 48-bit and Float32 rows.
+    packets = Vector{_MixedPacket}(undef, np)
+    lo2 = zeros(np); err2 = zeros(np); Uabs = Vector{Matrix{Float64}}(undef, np)
+    Threads.@threads :dynamic for t in 1:np
+        M = packet_matrix(t); k = ks[t]; r1 = n64[t]; rm = r1 + r48[t]
+        nref = r32[t] > 0 ? rm : r1
+        hv = Float64[]; tau = Float64[]
+        U = rotated[t] ? gram_eig(M).vectors[:, end:-1:1] : zeros(0, 0)
+        W = if !rotated[t]
+            M
+        elseif !explicitU[t]
+            Uabs[t] = U
+            U' * M
+        else
+            # Householder QR of the leading singular vectors: the spans of
+            # Q[:, 1:j] and U[:, 1:j] agree for every j <= nref.
+            A, tau = LAPACK.geqrf!(U[:, 1:nref])
+            Q = LAPACK.ormqr!('L', 'N', A, tau, Matrix{Float64}(I, k, k))
+            hv = reduce(vcat, [A[i+1:k, i] for i in 1:nref])
+            Q' * M
+        end
+        hiW = view(W, 1:r1, :); midW = view(W, r1+1:rm, :); loW = view(W, rm+1:k, :)
+        midrows = _InterleavedRows{_T48}(midW); lorows = _InterleavedRows{Float32}(loW)
+        lo2[t] = beta2[t] * (_U32^2 * sum(abs2, loW) + length(loW) * 2.0^-300 + _U48^2 * sum(abs2, midW))
+        err2[t] = beta2[t] * (sum(abs2, Float64.(Matrix(lorows)) .- loW) + sum(abs2, Matrix(midrows) .- midW))
+        packets[t] = _MixedPacket(outrows[t], columns[t], _InterleavedRows{Float64}(hiW), midrows, lorows,
+            hv, tau, zeros(Ns[t]), zeros(isempty(tau) ? 0 : k))
     end
-    absorbed = Dict{Int,Matrix{Float64}}(order[t] => Us[t] for t in 1:nf if rotated[t] && !explicitU[t])
+    # Absorb rotations of explicit (unsaturated) row bases into transfers and leaf bases.
+    absorbed = Dict{Int,Matrix{Float64}}(order[t] => Uabs[t] for t in 1:nf if rotated[t] && !explicitU[t])
     rows = copy(p.rows)
     if !isempty(absorbed)
         parent = zeros(Int, length(rows))
@@ -374,46 +447,21 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
             rows[i] = _CompactBasisNode(V, E, n.coeff, n.indices, n.children, n.identity)
         end
     end
-    # Pass 2: rotated packets split into Float64 and Float32 rows.
-    packets = Vector{_MixedPacket}(undef, np)
-    lo2 = zeros(np); err2 = zeros(np)
-    Threads.@threads :dynamic for t in 1:np
-        M = packet_matrix(t); k = ks[t]; r1 = k - r2[t]
-        hv = Float64[]; tau = Float64[]
-        W = if !rotated[t]
-            M
-        elseif !explicitU[t]
-            Us[t]' * M
-        else
-            # Householder QR of the leading r1 singular vectors: Q[:, 1:r1] spans
-            # them and Q[:, r1+1:k] their orthogonal complement.
-            A, tau = LAPACK.geqrf!(Us[t][:, 1:r1])
-            Q = LAPACK.ormqr!('L', 'N', A, tau, Matrix{Float64}(I, k, k))
-            hv = reduce(vcat, [A[i+1:k, i] for i in 1:r1])
-            Q' * M
-        end
-        hiW = view(W, 1:r1, :); loW = view(W, r1+1:k, :)
-        lorows = _InterleavedRows{Float32}(loW)
-        lo2[t] = beta2[t] * (_U32^2 * sum(abs2, loW) + length(loW) * 2.0^-300)
-        err2[t] = beta2[t] * sum(abs2, Float64.(Matrix(lorows)) .- loW)
-        packets[t] = _MixedPacket(outrows[t], columns[t], _InterleavedRows{Float64}(hiW), lorows,
-            hv, tau, zeros(Ns[t]), zeros(isempty(tau) ? 0 : k))
-    end
     # Balanced static schedule over far and near packets (time model: Float32
     # elements stream about 1.4x faster than Float64 elements).
-    cost = [b.hi.rows * b.hi.N + 0.7 * b.lo.rows * b.lo.N + 4.0 * length(b.hv) + 2.0 * b.hi.N + 256.0 for b in packets]
+    cost = [b.hi.rows * b.hi.N + 1.35 * b.mid.rows * b.mid.N + 0.7 * b.lo.rows * b.lo.N + 4.0 * length(b.hv) + 2.0 * b.hi.N + 256.0 for b in packets]
     owner = _lpt_schedule(cost, workers)
     farschedule = [[t for t in 1:nf if owner[t] == w] for w in 1:workers]
     nearschedule = [[t - nf for t in nf+1:np if owner[t] == w] for w in 1:workers]
     sel(f, range) = sum((f(packets[t]) for t in range); init=0)
     precision = (; rtol=Float64(precision_rtol), reference_norm=eta,
         bound=sqrt(sum(lo2; init=0.0)), storage_perturbation=sqrt(sum(err2; init=0.0)),
-        float32_rows=sum(r2; init=0), rows=sum(ks; init=0), rotated_packets=count(rotated), packets=np,
-        near_rotated_packets=count(view(rotated, nf+1:np)), near_float32_rows=sum(view(r2, nf+1:np); init=0), absorbed_rotations=length(absorbed),
+        float32_rows=sum(r32; init=0), float48_rows=sum(r48; init=0), rows=sum(ks; init=0), rotated_packets=count(rotated), packets=np,
+        near_rotated_packets=count(view(rotated, nf+1:np)), near_float32_rows=sum(view(r32, nf+1:np); init=0), absorbed_rotations=length(absorbed),
         float64_far_bytes=sum((8 * ks[t] * Ns[t] for t in 1:nf); init=0),
         float64_near_bytes=sum((8 * ks[t] * Ns[t] for t in nf+1:np); init=0),
         far_bytes=sel(_packet_bytes, 1:nf), near_bytes=sel(_packet_bytes, nf+1:np),
-        float32_bytes=sel(b -> sizeof(b.lo.data), 1:np), rotation_bytes=sel(b -> sizeof(b.hv) + sizeof(b.tau), 1:np))
+        float32_bytes=sel(b -> _nbytes(b.lo.data), 1:np), float48_bytes=sel(b -> _nbytes(b.mid.data), 1:np), rotation_bytes=sel(b -> sizeof(b.hv) + sizeof(b.tau), 1:np))
     H2MixedPacketMatvecPlan(p.shape, rows, p.cols, packets[1:nf], packets[nf+1:np], farschedule, nearschedule,
         zeros(length(p.rowcoeff)), zeros(length(p.colcoeff)), zeros(length(p.rowbuffer)), zeros(length(p.colbuffer)),
         p.rowperm, p.colperm, [zeros(length(p.colcoeff)) for _ in 1:workers], [zeros(length(p.colbuffer)) for _ in 1:workers],
@@ -432,11 +480,13 @@ function _mixed_forward!(rowcoeff::Vector{Float64}, b::_MixedPacket, colcoeff::V
     if isempty(b.tau)
         zo = first(b.row) - 1
         _il_forward!(rowcoeff, zo, b.hi, s)
-        _il_forward!(rowcoeff, zo + b.hi.rows, b.lo, s)
+        _il_forward!(rowcoeff, zo + b.hi.rows, b.mid, s)
+        _il_forward!(rowcoeff, zo + b.hi.rows + b.mid.rows, b.lo, s)
     else
         z = b.zbuf; fill!(z, 0.0)
         _il_forward!(z, 0, b.hi, s)
-        _il_forward!(z, b.hi.rows, b.lo, s)
+        _il_forward!(z, b.hi.rows, b.mid, s)
+        _il_forward!(z, b.hi.rows + b.mid.rows, b.lo, s)
         _apply_reflectors!(z, b.hv, b.tau, false)
         zo = first(b.row) - 1
         @inbounds for i in eachindex(z)
@@ -450,7 +500,8 @@ function _mixed_transpose!(colcoeff::Vector{Float64}, b::_MixedPacket, rowcoeff:
     if isempty(b.tau)
         wo = first(b.row) - 1
         _il_adjoint!(s, b.hi, rowcoeff, wo)
-        _il_adjoint!(s, b.lo, rowcoeff, wo + b.hi.rows)
+        _il_adjoint!(s, b.mid, rowcoeff, wo + b.hi.rows)
+        _il_adjoint!(s, b.lo, rowcoeff, wo + b.hi.rows + b.mid.rows)
     else
         z = b.zbuf; zo = first(b.row) - 1
         @inbounds for i in eachindex(z)
@@ -458,7 +509,8 @@ function _mixed_transpose!(colcoeff::Vector{Float64}, b::_MixedPacket, rowcoeff:
         end
         _apply_reflectors!(z, b.hv, b.tau, true)
         _il_adjoint!(s, b.hi, z, 0)
-        _il_adjoint!(s, b.lo, z, b.hi.rows)
+        _il_adjoint!(s, b.mid, z, b.hi.rows)
+        _il_adjoint!(s, b.lo, z, b.hi.rows + b.mid.rows)
     end
     off = 0
     @inbounds for cr in b.columns
