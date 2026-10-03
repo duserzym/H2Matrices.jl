@@ -15,9 +15,12 @@
 - `compress_hmatrix_to_h2(...; threads)` builds row/column bases, independent
   subtrees and couplings with Julia tasks (default when Julia has several
   threads and BLAS uses one). Results are bitwise independent of the thread count.
-- `consume=true` releases H-matrix blocks during conversion (after strict
-  rank-cap checks) and `H2PacketMatvecPlan(h2; consume=true)` releases raw H²
-  blocks while packing. `assemble_h2matrix_adaptive` consumes its private
+- Couplings are formed as soon as both of their cluster bases are final, while
+  the remaining (top-level) basis work continues, using otherwise idle threads.
+- `consume=true` releases each H-matrix block as soon as its coupling exists
+  (during the basis construction; the H-matrix is unusable afterwards, also if
+  the conversion throws) and `H2PacketMatvecPlan(h2; consume=true)` releases
+  raw H² blocks while packing. `assemble_h2matrix_adaptive` consumes its private
   H-matrix and accepts `threads`.
 
 ## 0.1.3
