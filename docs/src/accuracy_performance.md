@@ -20,6 +20,9 @@ h2 = assemble_h2matrix_adaptive(K;
 | `maxrank` | Maximum retained basis rank | Accuracy if the required rank exceeds the cap |
 | `strict=true` | Reject a cap that violates a requested local threshold | Mesh, path or whole-campaign convergence |
 | `coupling_rtol` | Additional local coupling SVD truncation when requested | The original stored operator's accuracy without new checks |
+| `coupling_scale=:global` | Coupling truncation relative to the largest stored block norm instead of each block's own norm | A global error bound |
+| `coupling_precision=Float32` | Float32 storage of retained coupling components below `coupling_rtol*scale/eps(Float32)`, Float64 arithmetic | Accuracy without new checks |
+| `passthrough=true` | Exact folding of weakly compressing transfers into couplings (compact/packet plans) | Nothing beyond rounding; it adds no tolerance |
 | `nmax`, admissibility | Tree/block partitioning and resulting ranks/work | A mesh-independent best configuration |
 
 These are the validated PLAG066 parameters, not universal defaults. Tightening `rtol` cannot repair an insufficient rank cap, incomplete basis construction, or an energy-gradient inconsistency. Near-field blocks remain dense.
@@ -97,7 +100,17 @@ compact = H2CompactMatvecPlan(h2; coupling_rtol=1e-10)
 factored = H2LowRankMatvecPlan(h2; rtol=1e-10)
 ```
 
-These options perform local coupling SVD truncation and require another accuracy check. Recompression and relaxed basis tolerances likewise need a physical error budget. Do not infer equivalent torque accuracy from equivalent storage size or from the same numerical tolerance at different stages.
+These options perform local coupling SVD truncation and require another accuracy check.
+
+For product-only use, the exact `passthrough=true` option and the approximate global and mixed-precision coupling options compose:
+
+```julia
+compact = H2CompactMatvecPlan(h2; passthrough=true,
+    coupling_rtol=1.5e-11, coupling_scale=:global, coupling_precision=Float32)
+plan = H2PacketMatvecPlan(compact; workers=4)
+```
+
+[How the advances work](advances.md) lists measured storage and product errors for these settings. Recompression and relaxed basis tolerances likewise need a physical error budget. Do not infer equivalent torque accuracy from equivalent storage size or from the same numerical tolerance at different stages.
 
 Strict recompression is transactional:
 

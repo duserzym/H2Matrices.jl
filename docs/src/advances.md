@@ -109,6 +109,25 @@ The identity basis is never stored as a dense identity matrix: the upward pass c
 
 For the selected PLAG066 operator, 539 row nodes and 537 column nodes use implicit identity bases. Numeric storage falls from 337,784,464 to 302,752,824 bytes at the same ACA/basis tolerances. This saving is a property of the tested operator's saturated bases, not a universal percentage for H² matrices.
 
+## Fold weakly compressing transfers into couplings
+
+Above the saturated levels, a parent basis often compresses its children only mildly. On PLAG036 (12,415 boundary nodes, `eta=3`), depth-4 clusters of about 776 points keep rank about 423 from two children of rank about 249, so their transfer matrices are nearly square, while each such cluster has only a few couplings. These transfers made up about 30% of the compact plan's numbers.
+
+`H2CompactMatvecPlan(h2; passthrough=true)` lets such a node use its children's concatenated coefficients `[x_{c_1}; x_{c_2}]` of dimension `D` as its own coefficients. Its expansion `X = [T_{c_1}; T_{c_2}]` (the children's effective transfers) is folded into its couplings, `X*S` or `S*X'`, and into its own transfer to the parent, `X*E`; the children's transfers are no longer stored. The upward pass copies child coefficients and the downward pass adds them back. A node with rank `k`, parent rank `k_p` and summed coupling-partner width `W` is converted when
+
+```math
+(D-k)\,(k_p+W) < D\,k,
+```
+
+that is, when this stores fewer numbers. Applying the same rule with `D=|t|` places nearly saturated leaves in physical coordinates. Row decisions are made bottom-up with the column widths of the identity rule, then column decisions with the final row widths; iterating these decisions changed the PLAG066 total by less than 0.1 MB. Like implicit identities, this is exact up to floating-point rounding.
+
+| Operator (`eta=3`, ACA/basis `1e-11/1e-10`) | Compact packet storage | With `passthrough=true` | Forward/adjoint ms (4 workers) |
+|---|---:|---:|---|
+| PLAG066 (6,028 nodes) | 302.75 MB | 288.08 MB | 3.48/2.73 → 2.86/2.25 |
+| PLAG036 (12,415 nodes) | 714.85 MB | 661.02 MB | 9.46/8.05 → 7.92/6.37 |
+
+Products changed by at most `1e-15` relative to the original plan, and errors against exact dense products were unchanged. Timings are medians of interleaved runs in one process on a shared machine.
+
 ## Pack interactions into larger contiguous products
 
 Many small coupling products have call, indexing and memory-access overhead. `H2PacketMatvecPlan` groups couplings sharing a row coefficient range:
@@ -137,7 +156,25 @@ The selected tight-tolerance plan uses `coupling_rtol=nothing`. Reusable scratch
 
 `H2LowRankMatvecPlan`, optional compact-plan coupling SVD, relaxed basis tolerances and recompression can reduce storage further, but change the approximation. An earlier 244.40 MB candidate used basis tolerance `1e-7` and had screened torque discrepancy about `3.46e-7 T`. It passed that experiment's `1e-6 T` gate, but does not meet the later `1e-9 T` gate. The 303 MB result retains basis tolerance `1e-10`.
 
-The current packet constructor materializes factorized couplings when packing them. Combining SVD coupling compression with packets can therefore give up the factorized storage benefit, even though the stored approximation is retained.
+Packet plans keep factorized couplings as factors: left factors join the packet matrix and right factors are applied per segment, so the packet stores the compact plan's numbers (`keep_factors=false` restores re-materialization).
+
+## Truncate and round couplings against the operator scale
+
+A block-relative coupling tolerance resolves weak blocks to a much smaller absolute error than strong ones. With `coupling_scale=:global`, singular values of the compact couplings are discarded below `coupling_rtol` times the largest stored block norm, including the near field. Because many couplings of the saturated levels are physical-coordinate blocks, this acts like a global absolute truncation of those blocks, while the nested bases keep their `rtol`.
+
+`coupling_precision=Float32` additionally stores each retained component whose singular value is below `coupling_rtol*scale/eps(Float32)` in Float32, as factors or as a dense remainder, and keeps the larger components in Float64. The per-component rounding error is then comparable to the discarded components. Products load Float32 numbers and accumulate in Float64, so the adjoint remains the exact transpose of the stored operator up to Float64 rounding.
+
+These are approximations and require the same physical validation as any relaxed tolerance; the measured product errors in the next table were obtained against exact dense products and are not torque errors. Packet plans with four workers, `nmax=32`, ACA `1e-11`:
+
+| Case | Configuration | Storage | Max. relative product error (forward/adjoint) |
+|---|---|---:|---|
+| PLAG066 | baseline `eta=3`, `rtol=1e-10` | 302.75 MB | 1.85e-11 / 1.72e-11 |
+| PLAG066 | `eta=1.5`, `rtol=1e-10`, `passthrough`, global `coupling_rtol=2e-11` | 258.55 MB | 1.62e-11 / 1.65e-11 |
+| PLAG066 | `eta=1.5`, `rtol=5e-11`, `passthrough`, global `coupling_rtol=1.5e-11`, Float32 | 190.24 MB | 1.37e-11 / 1.38e-11 |
+| PLAG036 | baseline `eta=3`, `rtol=1e-10` | 714.85 MB | 7.71e-11 / 7.60e-11 |
+| PLAG036 | `eta=1.5`, `rtol=1e-10`, `passthrough`, global `coupling_rtol=2e-11` | 628.53 MB | 6.09e-11 / 6.16e-11 |
+
+The dense PLAG066 matrix needs 290.69 MB, so only the Float32 variant compresses it substantially at this accuracy. The physics of the kernel limits compression: at relative accuracy near `1e-11` the far field of clusters below roughly 200 points remains full rank even for `eta=0.5`, so much of the operator is stored as dense or physical-coordinate blocks whatever the admissibility.
 
 ## Implementation and background
 

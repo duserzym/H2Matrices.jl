@@ -9,8 +9,9 @@
     H=assemble_hmatrix(K,rt,ct;comp=PartialACA(;rtol=1e-12),threads=false,global_index=true)
     C=compress_hmatrix_to_h2(H;rtol=1e-11,maxrank=235,strict=true,_print=false)
     original=Matrix(C)
-    for gi in (true,false), crtol in (nothing,1e-12)
-        C.global_index=gi;P=H2CompactMatvecPlan(C;coupling_rtol=crtol)
+    for gi in (true,false), crtol in (nothing,1e-12), pt in (false,true), prec in (Float64,Float32)
+        prec===Float32 && crtol===nothing && continue
+        C.global_index=gi;P=H2CompactMatvecPlan(C;coupling_rtol=crtol,passthrough=pt,coupling_precision=prec)
         M=Matrix(C;global_index=gi)
         @test any(n->n.identity,P.rows)
         @test storage_bytes(P)<=storage_bytes(C)
