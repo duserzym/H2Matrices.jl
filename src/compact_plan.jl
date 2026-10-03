@@ -136,10 +136,14 @@ With `coupling_scale=:block` (default) singular values below `coupling_rtol`
 times the coupling's own largest singular value are discarded. With
 `coupling_scale=:global` the threshold is `coupling_rtol` times the largest
 spectral norm over all stored blocks (couplings and near field), so weak
-blocks are not resolved to a tighter absolute accuracy than strong ones. A
-coupling is factorized only when its factors use less storage than the
-coupling itself. `coupling_scale=:global` and `coupling_precision` qualify the
-truncation and therefore require `coupling_rtol`.
+blocks are not resolved to a tighter absolute accuracy than strong ones; a
+positive number `s` gives the absolute threshold `coupling_rtol*s` (for
+example with `s` from [`estimate_operator_scale`](@ref)), which skips the
+spectral norms. A coupling is replaced by factors only when they use less
+storage than the coupling itself (a coupling without any retained singular
+value is dropped). `coupling_scale` other than `:block` and
+`coupling_precision` qualify the truncation and therefore require
+`coupling_rtol`.
 
 `coupling_precision=Float32` additionally stores the retained singular
 components below `tau/eps(Float32)` (`tau` the truncation threshold) in
@@ -358,17 +362,19 @@ end
 function _validate_compact_options(coupling_rtol,coupling_scale,coupling_precision)
     coupling_rtol===nothing || (isfinite(coupling_rtol) && coupling_rtol>=0) ||
         throw(ArgumentError("coupling_rtol must be finite and nonnegative"))
-    coupling_scale in (:block,:global) || throw(ArgumentError("coupling_scale must be :block or :global"))
+    coupling_scale===:block || coupling_scale===:global ||
+        (coupling_scale isa Real && !(coupling_scale isa Bool) && isfinite(coupling_scale) && coupling_scale>0) ||
+        throw(ArgumentError("coupling_scale must be :block, :global or a positive finite number"))
     coupling_precision in (Float64,Float32,Float16) || throw(ArgumentError("coupling_precision must be Float64, Float32 or Float16"))
     # Both options only qualify coupling truncation: without it they would be
     # silently ignored, so both are rejected alike.
     coupling_rtol===nothing && coupling_scale!==:block &&
-        throw(ArgumentError("coupling_scale=:$coupling_scale requires coupling_rtol"))
+        throw(ArgumentError("coupling_scale=$(repr(coupling_scale)) requires coupling_rtol"))
     coupling_rtol===nothing && coupling_precision!==Float64 &&
         throw(ArgumentError("coupling_precision=$coupling_precision requires coupling_rtol"))
     nothing
 end
-function H2CompactMatvecPlan(h2::H2Matrix;coupling_rtol::Union{Nothing,Real}=nothing,coupling_scale::Symbol=:block,
+function H2CompactMatvecPlan(h2::H2Matrix;coupling_rtol::Union{Nothing,Real}=nothing,coupling_scale::Union{Symbol,Real}=:block,
                              passthrough::Bool=false,coupling_precision::Type=Float64,consume::Bool=false)
     coupling_rtol===nothing || (coupling_rtol=Float64(coupling_rtol))
     _validate_compact_options(coupling_rtol,coupling_scale,coupling_precision)
@@ -422,8 +428,9 @@ function H2CompactMatvecPlan(h2::H2Matrix;coupling_rtol::Union{Nothing,Real}=not
     couplings=if coupling_rtol===nothing
         exact
     else
-        # Largest stored block norm (near field included) as the operator scale.
-        scale=coupling_scale===:global ? max(_max_opnorm([b.S for b in exact]),_max_opnorm([b.D for b in dense])) : nothing
+        # :global: largest stored block norm (near field included) as the operator scale.
+        scale=coupling_scale===:global ? max(_max_opnorm([b.S for b in exact]),_max_opnorm([b.D for b in dense])) :
+            coupling_scale isa Real ? Float64(coupling_scale) : nothing
         mixed=coupling_precision!==Float64;half=coupling_precision===Float16
         # Release each transformed coupling once factorized to bound transient memory.
         out=Vector{mixed ? _MixedPlanCoupling : _LowRankPlanCoupling}(undef,length(exact));next=Threads.Atomic{Int}(1)

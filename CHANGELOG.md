@@ -34,6 +34,22 @@
   order. The upward pass, forward near field and downward pass now run in
   parallel, per-worker reduction buffers are removed, and products are bitwise
   independent of the worker count. Stored numeric data is unchanged.
+- Global (absolute) error control, opt-in: `compress_hmatrix_to_h2(...; atol,
+  safeguard_rtol)` keeps basis singular values above
+  `max(rtol*σ₁, min(atol, safeguard_rtol*σ₁))`;
+  `assemble_h2matrix_adaptive(...; error_control=:global, scale)` uses the
+  absolute ACA tolerance `aca_rtol*s` and basis threshold `rtol*s` with the
+  new `estimate_operator_scale` (RMS row norm from sampled kernel rows), and
+  also accepts explicit `atol`/`aca_atol`; `H2CompactMatvecPlan(...;
+  coupling_scale=:block|:global|s)` truncates couplings against their own
+  norm, the largest stored block norm or a given scale (`coupling_scale`
+  without `coupling_rtol` is rejected). Defaults are unchanged. On the
+  campaign's boundary operator global control saved only about 1% over
+  block-relative control at equal accuracy.
+- Packet plans keep factorized compact-plan couplings as factors
+  (`keep_factors=true`), in single- and multi-vector products, and drop
+  zero-rank couplings; compact plans release each exact coupling as it is
+  factorized.
 - Add `mul!(Y, plan, X)` and transpose/adjoint products with matrices for
   packet plans, streaming the operator once per block of up to 16 right-hand
   sides, `multi_workspace_bytes` and `release_multi_workspace!` (frees or

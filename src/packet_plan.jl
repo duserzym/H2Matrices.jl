@@ -227,6 +227,7 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,keep_factors::
             for i in groups[row];p.couplings[i]=_released_coupling(p.couplings[i]);end
             _released!(tracker,_packet_bytes(packet))
         end
+        isempty(packet.columns) && continue
         push!(packets,packet);slot+=packet.width
     end
     rowslots=slot
@@ -374,14 +375,19 @@ function _add_low!(q32,q16,b::_MixedPlanCoupling,cr,offset)
     nothing
 end
 # One row packet from the couplings `group` of row coefficient range `rc`.
+# Couplings without any retained component (zero rank after truncation) are
+# dropped; a packet without couplings has no columns.
+_nsegments(qs...)=sum(q->length(q.columns),qs)
 function _build_coupling_packet(p::H2CompactMatvecPlan,group,rc,slot,keep_factors)
     columns=UnitRange{Int}[];width=0
     q64=_PartBuilder{Float64}();q32=_PartBuilder{Float32}();q16=_PartBuilder{Float16}()
     for i in group
         b=p.couplings[i];cr=p.cols[b.col].coeff
-        push!(columns,cr)
+        n0=_nsegments(q64,q32,q16)
         _add_f64!(q64,b,cr,width,keep_factors)
         _add_low!(q32,q16,b,cr,width)
+        _nsegments(q64,q32,q16)==n0 && continue
+        push!(columns,cr)
         width+=length(cr)
     end
     f64=_finish_part(q64);f32=_finish_part(q32);f16=_finish_part(q16)
