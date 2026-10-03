@@ -133,8 +133,8 @@ Each packet is then applied by a single long-column kernel in both directions, s
 
 A product runs three phases of independent tasks:
 
-1. upward pass, one task per coefficient-bearing subtree of the input tree;
-2. interactions, one task per packet;
+1. upward pass, one task per coefficient-bearing subtree of the input tree, together with the near-field packets, which need no basis coefficients;
+2. coupling packets, one task per packet;
 3. slot reduction and downward pass, one task per coefficient-bearing subtree of the output tree.
 
 Subtrees rooted at the highest nodes with nonempty coefficients have disjoint coefficient and physical index ranges. In the interaction phase, a forward coupling packet owns its row coefficient range and a transposed near-field packet owns its column interval. The other two cases write private *slots*: the transposed coupling packet writes `M' * x̂_τ` and the forward near-field packet writes `Q_e * x_e`. The output subtree that owns each destination range adds the slots in fixed order, immediately before its downward pass. Near-field rows are split at subtree boundaries for this purpose.

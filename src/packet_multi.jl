@@ -185,6 +185,14 @@ function _interaction_task_k!(p,ws,k,w,t,K)
         end
     end
 end
+function _forward_task_k!(p,ws,i,w,K,down::F) where {F}
+    k=p.fwdtasks[i]
+    k<0 && return down(-k)
+    _interaction_task_k!(p,ws,k,w,false,K)
+    j=p.packetjob[k]
+    Threads.atomic_sub!(p.pending[j],1)==1 && down(j)
+    nothing
+end
 # Columns c0+1:c0+K of Y and X; requires ws.k >= K.
 function _packet_block!(Y,p::H2PacketMatvecPlan,X,alpha,beta,t,ws,c0,K)
     inputnodes,outputnodes=t ? (p.rows,p.cols) : (p.cols,p.rows)
@@ -200,8 +208,13 @@ function _packet_block!(Y,p::H2PacketMatvecPlan,X,alpha,beta,t,ws,c0,K)
     @inbounds for i in 1:loc*K;outputcoeff[i]=0.;end
     nup=length(up.jobs)
     _run_tasks!((k,w)->k<=nup ? _up_job_k!(inputcoeff,lic,inputnodes,input,li,up,k,K) : _interaction_task_k!(p,ws,p.neartasks[k-nup],w,t,K),p,nup+length(p.neartasks))
-    _run_tasks!((k,w)->_interaction_task_k!(p,ws,p.tasks[k],w,t,K),p,length(p.tasks))
-    _run_tasks!((k,w)->_down_job_k!(output,lo,outputcoeff,loc,reduced,lr,ws.slots,length(p.slots),outputnodes,down,k,K),p,length(down.jobs))
+    if t
+        _run_tasks!((k,w)->_interaction_task_k!(p,ws,p.tasks[k],w,t,K),p,length(p.tasks))
+        _run_tasks!((k,w)->_down_job_k!(output,lo,outputcoeff,loc,reduced,lr,ws.slots,length(p.slots),outputnodes,down,k,K),p,length(down.jobs))
+    else
+        _arm!(p)
+        _run_tasks!((k,w)->_forward_task_k!(p,ws,k,w,K,(j)->_down_job_k!(output,lo,outputcoeff,loc,reduced,lr,ws.slots,length(p.slots),outputnodes,down,j,K)),p,length(p.fwdtasks))
+    end
     @inbounds for v in 1:K, i in 1:lo
         j=op[i];o=output[i+(v-1)*lo]
         Y[j,c0+v]=iszero(beta) ? alpha*o : alpha*o+beta*Y[j,c0+v]

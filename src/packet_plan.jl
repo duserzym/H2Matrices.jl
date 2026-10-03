@@ -11,7 +11,8 @@
 # Slots are reduced in a fixed order by the downward-pass task that owns the
 # destination entries. A product therefore runs three phases of independent
 # tasks (upward pass with near-field packets, coupling packets, reduction plus
-# downward pass), no two
+# downward pass; forward downward passes start when their subtree's last
+# coupling packet completes), no two
 # tasks of a phase write the same entries, and every task has a fixed
 # evaluation order: products are deterministic and bitwise independent of the
 # worker count and of the dynamic task assignment.
@@ -90,6 +91,9 @@ struct H2PacketMatvecPlan <: AbstractMatrix{Float64}
     nearpackets::Vector{_NearPacket}
     tasks::Vector{Int}
     neartasks::Vector{Int}
+    fwdtasks::Vector{Int}
+    packetjob::Vector{Int}
+    jobdeps::Vector{Int}
     rowup::_TreeSchedule
     colup::_TreeSchedule
     rowdown::_TreeSchedule
@@ -104,6 +108,7 @@ struct H2PacketMatvecPlan <: AbstractMatrix{Float64}
     rowperm::Vector{Int}
     colperm::Vector{Int}
     counter::Threads.Atomic{Int}
+    pending::Vector{Threads.Atomic{Int}}
     multi::_MultiWorkspace
 end
 H2PacketMatvecPlan(h::H2Matrix;workers::Int=1)=H2PacketMatvecPlan(H2CompactMatvecPlan(h);workers)
@@ -223,11 +228,25 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1)
     tasks=sortperm([length(b.matrix) for b in packets];rev=true)
     neartasks=.-sortperm([length(b.matrix) for b in nearpackets];rev=true)
     maxrows=maximum((size(b.matrix,1) for b in nearpackets);init=0)
-    H2PacketMatvecPlan(p.shape,p.rows,p.cols,packets,nearpackets,tasks,neartasks,
+    rowdown=_tree_schedule(p.rows,rorder,rspans,rowrefs,extra)
+    # Forward products start the downward pass of a row subtree as soon as its
+    # last coupling packet completes. Subtrees with the costliest downward
+    # passes come first, so those passes overlap with the remaining packets.
+    rownode=Dict{Int,Int}()
+    for (k,job) in enumerate(rowdown.jobs), t in job.nodes
+        n=p.rows[rowdown.order[t]];isempty(n.coeff) || (rownode[first(n.coeff)]=k)
+    end
+    packetjob=[rownode[first(b.row)] for b in packets]
+    jobdeps=zeros(Int,length(rowdown.jobs));foreach(k->jobdeps[k]+=1,packetjob)
+    jobcost=[sum((length(p.rows[rowdown.order[t]].E) for t in job.nodes);init=0) for job in rowdown.jobs]
+    fwdtasks=sort(eachindex(packets);by=k->(-jobcost[packetjob[k]],packetjob[k],-length(packets[k].matrix)))
+    append!(fwdtasks,.-findall(iszero,jobdeps))
+    H2PacketMatvecPlan(p.shape,p.rows,p.cols,packets,nearpackets,tasks,neartasks,fwdtasks,packetjob,jobdeps,
         _tree_schedule(p.rows,rorder,rspans,none,Vector{_SlotRef}[]),_tree_schedule(p.cols,corder,cspans,cnone,Vector{_SlotRef}[]),
-        _tree_schedule(p.rows,rorder,rspans,rowrefs,extra),_tree_schedule(p.cols,corder,cspans,colrefs,Vector{_SlotRef}[]),
+        rowdown,_tree_schedule(p.cols,corder,cspans,colrefs,Vector{_SlotRef}[]),
         workers,zeros(length(p.rowcoeff)),zeros(length(p.colcoeff)),zeros(length(p.rowbuffer)),zeros(length(p.colbuffer)),
-        zeros(max(rowslots,slot)),[zeros(maxrows) for _ in 1:workers],p.rowperm,p.colperm,Threads.Atomic{Int}(0),_MultiWorkspace())
+        zeros(max(rowslots,slot)),[zeros(maxrows) for _ in 1:workers],p.rowperm,p.colperm,Threads.Atomic{Int}(0),
+        [Threads.Atomic{Int}(0) for _ in jobdeps],_MultiWorkspace())
 end
 Base.size(p::H2PacketMatvecPlan)=p.shape
 
@@ -337,6 +356,18 @@ function _interaction_task!(p,k,w,t)
         end
     end
 end
+_arm!(p::H2PacketMatvecPlan)=(for (c,d) in zip(p.pending,p.jobdeps);c[]=d;end)
+# Forward coupling packet, then the downward pass of its row subtree if this
+# was the subtree's last packet (the completing worker runs it; no waiting).
+# Entries `-j` run subtree `j`, which has no coupling packets, directly.
+function _forward_task!(p,i,w,down::F) where {F}
+    k=p.fwdtasks[i]
+    k<0 && return down(-k)
+    _interaction_task!(p,k,w,false)
+    j=p.packetjob[k]
+    Threads.atomic_sub!(p.pending[j],1)==1 && down(j)
+    nothing
+end
 # Apply f(1,w),...,f(n,w) with up to p.workers tasks `w`; tasks claim work
 # dynamically in the precomputed cost-descending order. The caller is worker 1.
 function _task_loop(f::F,counter,n,w) where {F}
@@ -375,8 +406,13 @@ function _packet_mul!(y,p::H2PacketMatvecPlan,x,alpha,beta,t)
     fill!(output,0.);fill!(outputcoeff,0.)
     nup=length(up.jobs)
     _run_tasks!((k,w)->k<=nup ? _up_job!(inputcoeff,inputnodes,input,up,k) : _interaction_task!(p,p.neartasks[k-nup],w,t),p,nup+length(p.neartasks))
-    _run_tasks!((k,w)->_interaction_task!(p,p.tasks[k],w,t),p,length(p.tasks))
-    _run_tasks!((k,w)->_down_job!(output,outputcoeff,reduced,p.slots,outputnodes,down,k),p,length(down.jobs))
+    if t
+        _run_tasks!((k,w)->_interaction_task!(p,p.tasks[k],w,t),p,length(p.tasks))
+        _run_tasks!((k,w)->_down_job!(output,outputcoeff,reduced,p.slots,outputnodes,down,k),p,length(down.jobs))
+    else
+        _arm!(p)
+        _run_tasks!((k,w)->_forward_task!(p,k,w,(j)->_down_job!(output,outputcoeff,reduced,p.slots,outputnodes,down,j)),p,length(p.fwdtasks))
+    end
     @inbounds for i in eachindex(output)
         j=op[i];y[j]=iszero(beta) ? alpha*output[i] : alpha*output[i]+beta*y[j]
     end
@@ -391,9 +427,10 @@ function storage_bytes(p::H2PacketMatvecPlan)
     sum((sizeof(b.matrix) for b in p.nearpackets);init=0)+sum((sizeof(b.matrix) for b in p.packets);init=0)
 end
 function Base.copy(p::H2PacketMatvecPlan)
-    H2PacketMatvecPlan(p.shape,p.rows,p.cols,p.packets,p.nearpackets,p.tasks,p.neartasks,p.rowup,p.colup,p.rowdown,p.coldown,p.workers,
+    H2PacketMatvecPlan(p.shape,p.rows,p.cols,p.packets,p.nearpackets,p.tasks,p.neartasks,p.fwdtasks,p.packetjob,p.jobdeps,p.rowup,p.colup,p.rowdown,p.coldown,p.workers,
         zeros(length(p.rowcoeff)),zeros(length(p.colcoeff)),zeros(length(p.rowbuffer)),zeros(length(p.colbuffer)),
-        zeros(length(p.slots)),[zeros(length(s)) for s in p.scratch],p.rowperm,p.colperm,Threads.Atomic{Int}(0),_MultiWorkspace())
+        zeros(length(p.slots)),[zeros(length(s)) for s in p.scratch],p.rowperm,p.colperm,Threads.Atomic{Int}(0),
+        [Threads.Atomic{Int}(0) for _ in p.pending],_MultiWorkspace())
 end
 Base.show(io::IO,p::H2PacketMatvecPlan)=print(io,"H2PacketMatvecPlan(",size(p,1)," × ",size(p,2),", ",p.workers," workers, ",storage_bytes(p)," numeric bytes)")
 Base.show(io::IO,::MIME"text/plain",p::H2PacketMatvecPlan)=show(io,p)
