@@ -9,8 +9,8 @@
     H=assemble_hmatrix(K,rt,ct;comp=PartialACA(;rtol=1e-12),threads=false,global_index=true)
     C=compress_hmatrix_to_h2(H;rtol=1e-11,maxrank=235,strict=true,_print=false)
     original=Matrix(C)
-    for gi in (true,false), crtol in (nothing,1e-12), pt in (false,true), prec in (Float64,Float32)
-        prec===Float32 && crtol===nothing && continue
+    for gi in (true,false), crtol in (nothing,1e-12), pt in (false,true), prec in (Float64,Float32,Float16)
+        prec!==Float64 && crtol===nothing && continue
         C.global_index=gi;P=H2CompactMatvecPlan(C;coupling_rtol=crtol,passthrough=pt,coupling_precision=prec)
         M=Matrix(C;global_index=gi)
         @test any(n->n.identity,P.rows)
@@ -140,13 +140,17 @@ end
     @test_throws ArgumentError H2CompactMatvecPlan(C;coupling_rtol=1e-8,coupling_scale=:relative)
     # Mixed precision: Float32 storage for small singular components, Float64 arithmetic.
     @test_throws ArgumentError H2CompactMatvecPlan(C;coupling_precision=Float32)
-    @test_throws ArgumentError H2CompactMatvecPlan(C;coupling_rtol=1e-8,coupling_precision=Float16)
-    for pt in (false,true),scale in (:block,:global)
+    @test_throws ArgumentError H2CompactMatvecPlan(C;coupling_rtol=1e-8,coupling_precision=BigFloat)
+    @test_throws ArgumentError H2CompactMatvecPlan(C;coupling_precision=Float16)
+    for pt in (false,true),scale in (:block,:global),prec in (Float32,Float16)
         F64=H2CompactMatvecPlan(C;coupling_rtol=1e-9,coupling_scale=scale,passthrough=pt)
-        F32=H2CompactMatvecPlan(C;coupling_rtol=1e-9,coupling_scale=scale,passthrough=pt,coupling_precision=Float32)
+        F32=H2CompactMatvecPlan(C;coupling_rtol=1e-9,coupling_scale=scale,passthrough=pt,coupling_precision=prec)
         @test any(b->!isempty(b.L32),F32.couplings)
         @test any(b->b.R32!==nothing,F32.couplings) && any(b->b.R!==nothing && b.R32===nothing && !isempty(b.L32),F32.couplings)
+        prec===Float16 && @test any(b->!isempty(b.c16),F32.couplings)
+        prec===Float32 && @test all(b->isempty(b.c16),F32.couplings)
         @test storage_bytes(F32)<storage_bytes(F64)
+        prec===Float16 && @test storage_bytes(F32)<storage_bytes(H2CompactMatvecPlan(C;coupling_rtol=1e-9,coupling_scale=scale,passthrough=pt,coupling_precision=Float32))
         @test norm(F32*x-M*x)/norm(M*x)<1e-7
         @test norm(adjoint(F32)*z-M'*z)/norm(M'*z)<1e-7
         # Both directions apply the same stored numbers in Float64 arithmetic.
@@ -154,7 +158,8 @@ end
         for workers in (1,4)
             K32=H2PacketMatvecPlan(F32;workers)
             @test storage_bytes(K32)==storage_bytes(F32)
-            @test any(b->!isempty(b.columns32),K32.packets)
+            @test any(b->!isempty(b.p32.columns),K32.packets)
+            prec===Float16 && @test any(b->!isempty(b.p16.columns),K32.packets)
             for (B,input,ref) in ((K32,x,F32*x),(transpose(K32),z,transpose(F32)*z),(adjoint(K32),z,adjoint(F32)*z))
                 @test B*input ≈ ref rtol=1e-13
                 y=randn(rng,1200);old=copy(y)
@@ -163,7 +168,8 @@ end
             end
             @test dot(z,K32*x) ≈ dot(adjoint(K32)*z,x) rtol=1e-13
             Q=copy(K32)
-            @test all(b.matrix32===c.matrix32 && (isempty(b.scratch32) || b.scratch32!==c.scratch32) for (b,c) in zip(K32.packets,Q.packets))
+            @test all(b.p32.matrix===c.p32.matrix && (isempty(b.p32.scratch) || b.p32.scratch!==c.p32.scratch) &&
+                      (isempty(b.p16.scratch) || b.p16.scratch!==c.p16.scratch) for (b,c) in zip(K32.packets,Q.packets))
             @test Q*x ≈ K32*x rtol=1e-14
         end
         G=copy(F32);@test G*x ≈ F32*x rtol=1e-14
@@ -181,5 +187,8 @@ end
     @test H2Matrices._mixed_mul!(copy(v),A32,u) ≈ v+Float64.(A32)*u rtol=1e-14
     @test H2Matrices._mixed_tmul!(zeros(23),A32,v,false) ≈ Float64.(A32)'*v rtol=1e-14
     @test H2Matrices._mixed_tmul!(copy(u),A32,v,true) ≈ u+Float64.(A32)'*v rtol=1e-14
+    A16=Float16.(A32)
+    @test H2Matrices._mixed_mul!(copy(v),A16,u) ≈ v+Float64.(A16)*u rtol=1e-14
+    @test H2Matrices._mixed_tmul!(zeros(23),A16,v,false) ≈ Float64.(A16)'*v rtol=1e-14
     @test_throws DimensionMismatch H2Matrices._mixed_mul!(zeros(3),A32,u)
 end

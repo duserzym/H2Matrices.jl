@@ -110,8 +110,10 @@ retained singular components below `coupling_rtol*scale/eps(Float32)` in
 Float32, either as factors or as a dense remainder, keeping the larger
 components in Float64. Products still use Float64 arithmetic, so the adjoint
 remains the exact transpose of the stored operator up to Float64 rounding.
-The Float32 rounding error per component is comparable to the discarded
-components, so validate it like any coupling truncation.
+`coupling_precision=Float16` adds a third tier: components below
+`coupling_rtol*scale/eps(Float16)` are stored as Float16 factors with
+power-of-two column scales. The rounding error per component is comparable
+to the discarded components, so validate it like any coupling truncation.
 The plan retains numerical data but not the source operator or unused bases.
 Its adjoint applies the same stored approximation. Use one plan per concurrent
 worker and do not mutate shared source data while a plan is in use.
@@ -129,10 +131,11 @@ struct H2CompactMatvecPlan{C} <: AbstractMatrix{Float64}
     rowperm::Vector{Int}
     colperm::Vector{Int}
 end
-# Float32-stored matrices applied in Float64 arithmetic: the stored numbers are
-# exact in Float64, so forward and transposed products apply the same operator
-# up to Float64 rounding. y .+= A*x
-function _mixed_mul!(y::AbstractVector{Float64},A::Matrix{Float32},x::AbstractVector{Float64})
+# Float32/Float16-stored matrices applied in Float64 arithmetic: the stored
+# numbers are exact in Float64, so forward and transposed products apply the
+# same operator up to Float64 rounding. y .+= A*x
+const _LowFloat=Union{Float32,Float16}
+function _mixed_mul!(y::AbstractVector{Float64},A::Matrix{<:_LowFloat},x::AbstractVector{Float64})
     m,n=size(A)
     (length(y)==m && length(x)==n) || throw(DimensionMismatch("mixed-precision product dimensions"))
     j=1
@@ -153,7 +156,7 @@ function _mixed_mul!(y::AbstractVector{Float64},A::Matrix{Float32},x::AbstractVe
     y
 end
 # y = A'*x (accumulate=false) or y .+= A'*x
-function _mixed_tmul!(y::AbstractVector{Float64},A::Matrix{Float32},x::AbstractVector{Float64},accumulate::Bool)
+function _mixed_tmul!(y::AbstractVector{Float64},A::Matrix{<:_LowFloat},x::AbstractVector{Float64},accumulate::Bool)
     m,n=size(A)
     (length(y)==n && length(x)==m) || throw(DimensionMismatch("mixed-precision product dimensions"))
     @inbounds for j in 1:n
@@ -165,38 +168,53 @@ function _mixed_tmul!(y::AbstractVector{Float64},A::Matrix{Float32},x::AbstractV
     end
     y
 end
-# A coupling stored as a Float64 part plus a Float32 part. Float64 part: dense
-# `L` (`R===nothing`) or factors `L*R'`; Float32 part: dense remainder `L32`
-# (`R32===nothing`) or factors `L32*R32'`.
+# A coupling stored as a Float64 part, a Float32 part and a Float16 part.
+# Float64 part: dense `L` (`R===nothing`) or factors `L*R'`; Float32 part:
+# dense remainder `L32` (`R32===nothing`) or factors `L32*R32'`; Float16 part:
+# factors `L16*Diagonal(c16)*R16'` with power-of-two column scales `c16`.
 struct _MixedPlanCoupling
     L::Matrix{Float64}
     R::Union{Nothing,Matrix{Float64}}
     L32::Matrix{Float32}
     R32::Union{Nothing,Matrix{Float32}}
+    L16::Matrix{Float16}
+    R16::Matrix{Float16}
+    c16::Vector{Float64}
     scratch::Vector{Float64}
     row::Int
     col::Int
 end
+const _NO16=Matrix{Float16}(undef,0,0)
+# Columns scaled by powers of two (exact) so Float16 keeps its relative precision.
+function _half_factors(A,B)
+    ea=[iszero(x) ? 0 : exponent(x) for x in vec(maximum(abs,A;dims=1))]
+    eb=[iszero(x) ? 0 : exponent(x) for x in vec(maximum(abs,B;dims=1))]
+    Float16.(A*Diagonal(exp2.(-ea))),Float16.(B*Diagonal(exp2.(-eb))),exp2.(ea.+eb)
+end
 # Keep singular components above `tau=rtol*scale` (block norm if `scale===nothing`).
-# Components below `tau/eps(Float32)` are stored in Float32: their rounding error
-# is at most about `tau`, the size of the discarded components. The cheapest of
-# exact dense Float64, mixed factors, or Float64 factors plus a Float32 dense
-# remainder is kept.
-function _mixed_plan_coupling(S,row,col,rtol,scale=nothing)
+# Components below `tau/eps(Float32)` are stored in Float32 and, with `half`,
+# those below `tau/eps(Float16)` in scaled Float16: the rounding error of each
+# is at most about `tau`, the size of the discarded components. The cheapest
+# of exact dense Float64, mixed factors, or Float64 factors plus a Float32
+# dense remainder is kept.
+function _mixed_plan_coupling(S,row,col,rtol,scale=nothing,half::Bool=false)
     m,n=size(S);none=Matrix{Float32}(undef,0,0)
-    isempty(S) && return _MixedPlanCoupling(S,nothing,none,nothing,Float64[],row,col)
+    isempty(S) && return _MixedPlanCoupling(S,nothing,none,nothing,_NO16,_NO16,Float64[],Float64[],row,col)
     F=svd(S);s=F.S
     tau=rtol*(scale===nothing ? s[1] : scale)
-    k=count(>(tau),s);hi=count(>(tau/eps(Float32)),s);lo=k-hi
-    dense=8m*n;fact=(8hi+4lo)*(m+n);split=8hi*(m+n)+4m*n
+    k=count(>(tau),s);hi=count(>(tau/eps(Float32)),s)
+    mid=half ? count(>(tau/eps(Float16)),s)-hi : k-hi;lo=k-hi-mid
+    dense=8m*n;fact=(8hi+4mid+2lo)*(m+n)+8lo;split=8hi*(m+n)+4m*n
     if dense<=min(fact,split)
-        return _MixedPlanCoupling(S,nothing,none,nothing,Float64[],row,col)
+        return _MixedPlanCoupling(S,nothing,none,nothing,_NO16,_NO16,Float64[],Float64[],row,col)
     end
     L=F.U[:,1:hi]*Diagonal(s[1:hi]);R=F.V[:,1:hi]
     if fact<=split
-        _MixedPlanCoupling(L,R,Float32.(F.U[:,hi+1:k]*Diagonal(s[hi+1:k])),Float32.(F.V[:,hi+1:k]),zeros(max(hi,lo)),row,col)
+        a,b=hi+1:hi+mid,hi+mid+1:k
+        L16,R16,c16=lo>0 ? _half_factors(F.U[:,b]*Diagonal(s[b]),F.V[:,b]) : (_NO16,_NO16,Float64[])
+        _MixedPlanCoupling(L,R,Float32.(F.U[:,a]*Diagonal(s[a])),Float32.(F.V[:,a]),L16,R16,c16,zeros(max(hi,mid,lo)),row,col)
     else
-        _MixedPlanCoupling(L,R,Float32.(S-L*R'),nothing,zeros(hi),row,col)
+        _MixedPlanCoupling(L,R,Float32.(S-L*R'),nothing,_NO16,_NO16,Float64[],zeros(hi),row,col)
     end
 end
 function _plan_coupling_mul!(y,b::_MixedPlanCoupling,x,t)
@@ -214,6 +232,12 @@ function _plan_coupling_mul!(y,b::_MixedPlanCoupling,x,t)
         else
             _mixed_tmul!(z,b.R32,x,false);_mixed_mul!(y,b.L32,z)
         end
+    end
+    if !isempty(b.c16)
+        z=view(b.scratch,1:length(b.c16))
+        _mixed_tmul!(z,t ? b.L16 : b.R16,x,false)
+        for i in eachindex(z);z[i]*=b.c16[i];end
+        _mixed_mul!(y,t ? b.R16 : b.L16,z)
     end
     y
 end
@@ -248,9 +272,9 @@ function H2CompactMatvecPlan(h2::H2Matrix;coupling_rtol::Union{Nothing,Float64}=
     coupling_rtol===nothing || (isfinite(coupling_rtol) && coupling_rtol>=0) ||
         throw(ArgumentError("coupling_rtol must be finite and nonnegative"))
     coupling_scale in (:block,:global) || throw(ArgumentError("coupling_scale must be :block or :global"))
-    coupling_precision in (Float64,Float32) || throw(ArgumentError("coupling_precision must be Float64 or Float32"))
-    coupling_precision===Float32 && coupling_rtol===nothing &&
-        throw(ArgumentError("coupling_precision=Float32 requires coupling_rtol"))
+    coupling_precision in (Float64,Float32,Float16) || throw(ArgumentError("coupling_precision must be Float64, Float32 or Float16"))
+    coupling_precision!==Float64 && coupling_rtol===nothing &&
+        throw(ArgumentError("coupling_precision=$coupling_precision requires coupling_rtol"))
     blocks=Tuple{typeof(h2.row_basis),typeof(h2.col_basis),UniformBlock}[];denseblocks=typeof(h2)[]
     function collect_blocks(h)
         if isleaf(h)
@@ -299,7 +323,7 @@ function H2CompactMatvecPlan(h2::H2Matrix;coupling_rtol::Union{Nothing,Float64}=
         else
             nothing
         end
-        mixed=coupling_precision===Float32
+        mixed=coupling_precision!==Float64;half=coupling_precision===Float16
         # Release each transformed coupling once factorized to bound transient memory.
         out=Vector{mixed ? _MixedPlanCoupling : _LowRankPlanCoupling}(undef,length(exact));next=Threads.Atomic{Int}(1)
         @sync for _ in 1:min(Threads.nthreads(),max(length(exact),1))
@@ -307,7 +331,7 @@ function H2CompactMatvecPlan(h2::H2Matrix;coupling_rtol::Union{Nothing,Float64}=
                 i=Threads.atomic_add!(next,1)
                 i>length(exact) && break
                 b=exact[i]
-                out[i]=mixed ? _mixed_plan_coupling(b.S,b.row,b.col,coupling_rtol,scale) :
+                out[i]=mixed ? _mixed_plan_coupling(b.S,b.row,b.col,coupling_rtol,scale,half) :
                     _factor_plan_coupling(b.S,b.row,b.col,coupling_rtol,scale)
                 exact[i]=_PlanCoupling(zeros(0,0),b.row,b.col)
             end
@@ -385,8 +409,9 @@ Base.show(io::IO,::MIME"text/plain",p::Union{H2CompactMatvecPlan,H2LowRankMatvec
 # Copy only worker scratch. Geometry, bases and stored matrices remain shared.
 _coupling_bytes(b::_PlanCoupling)=sizeof(b.S)
 _coupling_bytes(b::_LowRankPlanCoupling)=sizeof(b.L)+(b.R===nothing ? 0 : sizeof(b.R))
-_coupling_bytes(b::_MixedPlanCoupling)=sizeof(b.L)+(b.R===nothing ? 0 : sizeof(b.R))+sizeof(b.L32)+(b.R32===nothing ? 0 : sizeof(b.R32))
-_copy_plan_couplings(c::Vector{_MixedPlanCoupling})=[_MixedPlanCoupling(b.L,b.R,b.L32,b.R32,zeros(length(b.scratch)),b.row,b.col) for b in c]
+_coupling_bytes(b::_MixedPlanCoupling)=sizeof(b.L)+(b.R===nothing ? 0 : sizeof(b.R))+sizeof(b.L32)+(b.R32===nothing ? 0 : sizeof(b.R32))+
+    sizeof(b.L16)+sizeof(b.R16)+sizeof(b.c16)
+_copy_plan_couplings(c::Vector{_MixedPlanCoupling})=[_MixedPlanCoupling(b.L,b.R,b.L32,b.R32,b.L16,b.R16,b.c16,zeros(length(b.scratch)),b.row,b.col) for b in c]
 _copy_plan_couplings(c::Vector{_PlanCoupling})=c
 _copy_plan_couplings(c::Vector{_LowRankPlanCoupling})=[_LowRankPlanCoupling(b.L,b.R,zeros(length(b.scratch)),b.row,b.col) for b in c]
 """

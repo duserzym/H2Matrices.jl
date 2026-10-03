@@ -3,23 +3,31 @@
 # (`factors[i]` nonempty, `direct[i]==false`) stores the right factor `R` of
 # `S = L*R'` and contributes `R'*x` while `L` lives in `matrix`. An empty
 # `factors` vector marks an all-direct packet.
-# Mixed-precision couplings add a Float32 packet part with the same layout
-# (`matrix32`, `columns32`, `factors32`), applied in Float64 arithmetic.
+# Mixed-precision couplings add Float32 and Float16 packet parts with the same
+# layout, applied in Float64 arithmetic; Float16 segments carry column scales.
+struct _LowPart{T}
+    matrix::Matrix{T}
+    columns::Vector{UnitRange{Int}}
+    factors::Vector{Matrix{T}}          # 0x0: direct segment
+    scales::Vector{Vector{Float64}}     # empty: unscaled part
+    scratch::Vector{Float64}
+end
+_LowPart{T}() where {T}=_LowPart{T}(Matrix{T}(undef,0,0),UnitRange{Int}[],Matrix{T}[],Vector{Float64}[],Float64[])
+_copy_lowpart(p::_LowPart{T}) where {T}=_LowPart{T}(p.matrix,p.columns,p.factors,p.scales,zeros(length(p.scratch)))
+_lowpart_bytes(p::_LowPart)=sizeof(p.matrix)+sum(sizeof,p.factors;init=0)+sum(sizeof,p.scales;init=0)
 struct _CouplingPacket
     matrix::Matrix{Float64}
     row::UnitRange{Int}
     columns::Vector{UnitRange{Int}}
     scratch::Vector{Float64}
     factors::Vector{Matrix{Float64}}
-    matrix32::Matrix{Float32}
-    columns32::Vector{UnitRange{Int}}
-    scratch32::Vector{Float64}
-    factors32::Vector{Matrix{Float32}}
+    p32::_LowPart{Float32}
+    p16::_LowPart{Float16}
 end
 _CouplingPacket(matrix,row,columns,scratch,factors=Matrix{Float64}[])=
-    _CouplingPacket(matrix,row,columns,scratch,factors,Matrix{Float32}(undef,0,0),UnitRange{Int}[],Float64[],Matrix{Float32}[])
+    _CouplingPacket(matrix,row,columns,scratch,factors,_LowPart{Float32}(),_LowPart{Float16}())
 _copy_packet(b::_CouplingPacket)=_CouplingPacket(b.matrix,b.row,b.columns,zeros(length(b.scratch)),b.factors,
-    b.matrix32,b.columns32,zeros(length(b.scratch32)),b.factors32)
+    _copy_lowpart(b.p32),_copy_lowpart(b.p16))
 """
     H2PacketMatvecPlan(h2; workers=1)
     H2PacketMatvecPlan(compact_plan; workers=1, keep_factors=true)
@@ -35,9 +43,10 @@ worker-order reduction. Use BLAS threads=1 when enabling packet workers.
 Couplings factorized by `H2CompactMatvecPlan(h2; coupling_rtol)` keep their
 factors (`S = L*R'`): left factors join the packet matrix and right factors
 are applied per segment, so the packet stores exactly the compact plan's
-numbers. `keep_factors=false` re-materializes `L*R'` instead. Float32 parts
-of mixed-precision couplings (`coupling_precision=Float32`) form a second
-packet part that is stored in Float32 and applied in Float64 arithmetic.
+numbers. `keep_factors=false` re-materializes `L*R'` instead. Float32 and
+Float16 parts of mixed-precision couplings (`coupling_precision`) form
+further packet parts that keep their storage precision and are applied in
+Float64 arithmetic.
 
 One plan is not safe for concurrent calls; `copy(plan)` shares numerical data
 and allocates independent scratch for an additional caller. Source data must
@@ -73,6 +82,7 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,keep_factors::
     for row in order
         columns=UnitRange{Int}[];blocks=Matrix{Float64}[];factors=Matrix{Float64}[];anyfactor=false
         columns32=UnitRange{Int}[];blocks32=Matrix{Float32}[];factors32=Matrix{Float32}[]
+        columns16=UnitRange{Int}[];blocks16=Matrix{Float16}[];factors16=Matrix{Float16}[];scales16=Vector{Float64}[]
         rc=p.rows[row].coeff
         for i in groups[row]
             b=p.couplings[i];cc=p.cols[b.col].coeff
@@ -93,11 +103,14 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,keep_factors::
             elseif size(b.R32,2)>0
                 push!(columns32,cc);push!(blocks32,b.L32);push!(factors32,b.R32)
             end
+            isempty(b.c16) || (push!(columns16,cc);push!(blocks16,b.L16);push!(factors16,b.R16);push!(scales16,b.c16))
         end
         matrix=isempty(blocks) ? zeros(length(rc),0) : reduce(hcat,blocks)
-        matrix32=isempty(blocks32) ? Matrix{Float32}(undef,0,0) : reduce(hcat,blocks32)
-        push!(packets,_CouplingPacket(matrix,rc,columns,zeros(size(matrix,2)),anyfactor ? factors : Matrix{Float64}[],
-            matrix32,columns32,zeros(size(matrix32,2)),factors32))
+        p32=isempty(blocks32) ? _LowPart{Float32}() :
+            (m32=reduce(hcat,blocks32);_LowPart{Float32}(m32,columns32,factors32,Vector{Float64}[],zeros(size(m32,2))))
+        p16=isempty(blocks16) ? _LowPart{Float16}() :
+            (m16=reduce(hcat,blocks16);_LowPart{Float16}(m16,columns16,factors16,scales16,zeros(size(m16,2))))
+        push!(packets,_CouplingPacket(matrix,rc,columns,zeros(size(matrix,2)),anyfactor ? factors : Matrix{Float64}[],p32,p16))
     end
     neargroups=Dict{UnitRange{Int},Vector{Int}}();nearorder=UnitRange{Int}[]
     for (i,b) in enumerate(p.dense)
@@ -138,43 +151,56 @@ function _packet_forward!(rowcoeff,b::_CouplingPacket,colcoeff)
         end
     end
     size(b.matrix,2)>0 && mul!(view(rowcoeff,b.row),b.matrix,b.scratch,1.,1.)
-    isempty(b.columns32) || _packet32_forward!(rowcoeff,b,colcoeff)
+    _lowpart_forward!(rowcoeff,b.row,b.p32,colcoeff)
+    _lowpart_forward!(rowcoeff,b.row,b.p16,colcoeff)
     rowcoeff
 end
-function _packet32_forward!(rowcoeff,b::_CouplingPacket,colcoeff)
-    offset=0
-    for (s,cr) in enumerate(b.columns32)
-        R=b.factors32[s]
+function _lowpart_forward!(rowcoeff,row,p::_LowPart,colcoeff)
+    isempty(p.columns) && return nothing
+    offset=0;scaled=!isempty(p.scales)
+    for (s,cr) in enumerate(p.columns)
+        R=p.factors[s]
         if size(R,1)==0
-            for (i,j) in enumerate(cr);b.scratch32[offset+i]=colcoeff[j];end
+            for (i,j) in enumerate(cr);p.scratch[offset+i]=colcoeff[j];end
             offset+=length(cr)
         else
             r=size(R,2)
-            _mixed_tmul!(view(b.scratch32,offset+1:offset+r),R,view(colcoeff,cr),false)
+            _mixed_tmul!(view(p.scratch,offset+1:offset+r),R,view(colcoeff,cr),false)
+            if scaled
+                c=p.scales[s]
+                for i in 1:r;p.scratch[offset+i]*=c[i];end
+            end
             offset+=r
         end
     end
-    _mixed_mul!(view(rowcoeff,b.row),b.matrix32,b.scratch32)
+    _mixed_mul!(view(rowcoeff,row),p.matrix,p.scratch)
+    nothing
 end
-function _packet32_transpose!(colcoeff,b::_CouplingPacket,rowcoeff)
-    _mixed_tmul!(b.scratch32,b.matrix32,view(rowcoeff,b.row),false)
-    offset=0
-    for (s,cr) in enumerate(b.columns32)
-        R=b.factors32[s]
+function _lowpart_transpose!(colcoeff,row,p::_LowPart,rowcoeff)
+    isempty(p.columns) && return nothing
+    _mixed_tmul!(p.scratch,p.matrix,view(rowcoeff,row),false)
+    offset=0;scaled=!isempty(p.scales)
+    for (s,cr) in enumerate(p.columns)
+        R=p.factors[s]
         if size(R,1)==0
-            for (i,j) in enumerate(cr);colcoeff[j]+=b.scratch32[offset+i];end
+            for (i,j) in enumerate(cr);colcoeff[j]+=p.scratch[offset+i];end
             offset+=length(cr)
         else
             r=size(R,2)
-            _mixed_mul!(view(colcoeff,cr),R,view(b.scratch32,offset+1:offset+r))
+            if scaled
+                c=p.scales[s]
+                for i in 1:r;p.scratch[offset+i]*=c[i];end
+            end
+            _mixed_mul!(view(colcoeff,cr),R,view(p.scratch,offset+1:offset+r))
             offset+=r
         end
     end
-    colcoeff
+    nothing
 end
 function _packet_transpose!(colcoeff,b::_CouplingPacket,rowcoeff)
-    isempty(b.columns32) || _packet32_transpose!(colcoeff,b,rowcoeff)
-    size(b.matrix,2)>0 || return colcoeff
+    _lowpart_transpose!(colcoeff,b.row,b.p32,rowcoeff)
+    _lowpart_transpose!(colcoeff,b.row,b.p16,rowcoeff)
+    size(b.matrix,2)>0 || return nothing
     mul!(b.scratch,b.matrix',view(rowcoeff,b.row))
     offset=0
     if isempty(b.factors)
@@ -195,6 +221,7 @@ function _packet_transpose!(colcoeff,b::_CouplingPacket,rowcoeff)
             end
         end
     end
+    nothing
 end
 function _packet_worker!(p,worker,transposed)
     count=length(p.partials)
@@ -275,7 +302,7 @@ Base.:*(p::Union{H2PacketMatvecPlan,TransposedPacketH2Plan},x::AbstractVector)=m
 function storage_bytes(p::H2PacketMatvecPlan)
     sum((sizeof(n.V)+sizeof(n.E) for ns in (p.rows,p.cols) for n in ns);init=0)+
     sum((sizeof(b.matrix) for b in p.nearpackets);init=0)+
-    sum((sizeof(b.matrix)+sum(sizeof,b.factors;init=0)+sizeof(b.matrix32)+sum(sizeof,b.factors32;init=0) for b in p.packets);init=0)
+    sum((sizeof(b.matrix)+sum(sizeof,b.factors;init=0)+_lowpart_bytes(b.p32)+_lowpart_bytes(b.p16) for b in p.packets);init=0)
 end
 function Base.copy(p::H2PacketMatvecPlan)
     packets=[_copy_packet(b) for b in p.packets]
