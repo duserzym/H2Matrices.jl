@@ -51,7 +51,7 @@ The selected operator saves **10.37%** versus corrected H² and **20.03%** versu
 
 Matvec timings are medians of nine batches of twenty products after warm-up. Paired solver timings are single runs. The original tight-tolerance H² NEB polish took about 84 s in an earlier run; cross-run comparisons are less controlled than the paired results below.
 
-The compact stage uses 539 implicit row bases and 537 implicit column bases. The packet operator has 263 coupling packets and 448 near-field packets. Near-field forward rows overlap on this grain, so that part falls back to serial evaluation. The adjoint uses private worker reduction buffers.
+The compact stage uses 539 implicit row bases and 537 implicit column bases. The packet operator has 263 coupling packets and 448 near-field packets. Near-field forward rows overlap on this grain, so that part falls back to serial evaluation. The adjoint uses private worker reduction buffers. These timings describe the v0.1.3 packet plan; the unreleased packet layout (see [How the Advances Work](advances.md)) runs all phases in parallel and stores the same numeric data.
 
 ## Paired LEM and NEB results
 
