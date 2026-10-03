@@ -152,21 +152,25 @@ function _down_job_k!(y,ly,coeff,lc,dest,ld,slots,ls,nodes,tree::_TreeSchedule,k
         end
     end
 end
-function _interaction_task_k!(p,ws,k,w,t,K)
-    lrc=length(p.rowcoeff);lcc=length(p.colcoeff);lrb=length(p.rowbuffer);lcb=length(p.colbuffer);ls=length(p.slots)
-    if k>0
-        b=p.packets[k];M=b.matrix
-        if t
-            s=ws.slots
-            @inbounds for v in 0:K-1, j in 1:size(M,2);s[b.slot+j+v*ls]=0.;end
-            _kernel_tk!(s,b.slot,ls,M,0,size(M,2),ws.rowcoeff,first(b.row)-1,lrc,K)
-        else
-            y0=first(b.row)-1;offset=0
-            for cr in b.columns
-                _kernel_nk!(ws.rowcoeff,y0,lrc,M,offset,length(cr),ws.colcoeff,first(cr)-1,lcc,K)
-                offset+=length(cr)
-            end
+function _coupling_task_k!(p,ws,b::_CouplingPacket,w,t,K)
+    lrc=length(p.rowcoeff);lcc=length(p.colcoeff);ls=length(p.slots);M=b.matrix
+    if t
+        s=ws.slots
+        @inbounds for v in 0:K-1, j in 1:size(M,2);s[b.slot+j+v*ls]=0.;end
+        _kernel_tk!(s,b.slot,ls,M,0,size(M,2),ws.rowcoeff,first(b.row)-1,lrc,K)
+    else
+        y0=first(b.row)-1;offset=0
+        for cr in b.columns
+            _kernel_nk!(ws.rowcoeff,y0,lrc,M,offset,length(cr),ws.colcoeff,first(cr)-1,lcc,K)
+            offset+=length(cr)
         end
+    end
+    nothing
+end
+function _interaction_task_k!(p,ws,k,w,t,K)
+    lrb=length(p.rowbuffer);lcb=length(p.colbuffer);ls=length(p.slots)
+    if k>0
+        _coupling_task_k!(p,ws,p.packets[k],w,t,K)
     else
         b=p.nearpackets[-k];M=b.matrix
         if t

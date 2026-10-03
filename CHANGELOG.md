@@ -38,6 +38,18 @@
   packet plans, streaming the operator once per block of up to 16 right-hand
   sides, `multi_workspace_bytes` and `release_multi_workspace!` (frees or
   shrinks the multi-RHS scratch kept by the plan).
+- Add `H2MixedPacketMatvecPlan(compact_or_h2; workers, precision_rtol=1e-13,
+  format48=false)` and `precision_summary`: coupling packets rotated to their
+  left singular basis store low-weight rows in Float32 (optionally a 48-bit
+  format) under an a priori Frobenius bound `precision_rtol * η` on the
+  reduced-precision rounding; products accumulate in Float64 and the adjoint
+  is the exact transpose of the stored operator. The plan runs on the
+  `H2PacketMatvecPlan` task engine (near field in Float64 column packets),
+  so products are bitwise independent of the worker count and support
+  several right-hand sides; construction is bitwise deterministic under
+  threads; `consume=true` releases the source H² blocks; packets whose norm
+  could overflow a reduced format stay in Float64. `H2PacketMatvecPlan` is
+  now parametric in its coupling-packet type (`H2PacketMatvecPlan{C}`).
 
 ## 0.1.3
 

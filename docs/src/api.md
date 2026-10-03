@@ -33,6 +33,8 @@ sampled_frobenius_error
 H2MatvecPlan
 H2CompactMatvecPlan
 H2PacketMatvecPlan
+H2MixedPacketMatvecPlan
+precision_summary
 H2LowRankMatvecPlan
 multi_workspace_bytes
 release_multi_workspace!
