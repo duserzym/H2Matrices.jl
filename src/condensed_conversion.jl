@@ -73,38 +73,46 @@ _local_rows(child, parent_range) =
     (first(index_range(child.cluster)) - first(parent_range) + 1):(last(index_range(child.cluster)) - first(parent_range) + 1)
 
 # Active matrix C_t = [D_t, inherited] for this cluster, or `nothing` if empty.
+# AB' = (A R_B') Q_B': the isometric partner Q drops out, so the weighted
+# columns A R_B' measure block error independently of factor scaling. The
+# partner QR is the same blocked Householder factorization as `qr(partner)`,
+# computed in a per-cluster workspace; TRMM reads only its upper triangle.
 function _active_matrix(cb::ClusterBasis, ctx::_BasisBuildContext, inherited)
     m = length(cb)
     entries = get(ctx.data, objectid(cb.cluster), nothing)
-    Rs = Matrix{Float64}[]
+    wd = 0; maxn = 0; maxr = 0
     if entries !== nothing
         for b in entries
-            # AB' = (A R_B') Q_B': the isometric partner Q drops out, so the
-            # weighted columns measure block error independently of factor scaling.
             partner = ctx.is_row ? b.B : b.A
-            push!(Rs, Matrix(qr(partner).R))
+            n, r = size(partner)
+            wd += min(n, r); maxn = max(maxn, n); maxr = max(maxr, r)
         end
     end
-    wd = sum((size(R, 1) for R in Rs); init=0)
     wi = inherited === nothing ? 0 : size(inherited, 2)
     w = wd + wi
     w == 0 && return nothing
     C = Matrix{Float64}(undef, m, w)
     off = 0
-    if entries !== nothing
-        for (b, R) in zip(entries, Rs)
-            r = size(R, 1)
-            r == 0 && continue
+    if wd > 0
+        work = Matrix{Float64}(undef, maxn, maxr)
+        tau = Matrix{Float64}(undef, min(36, maxn, maxr), min(maxn, maxr))
+        for b in entries
+            partner = ctx.is_row ? b.B : b.A
             factor = ctx.is_row ? b.A : b.B
-            dest = view(C, :, (off+1):(off+r))
-            if size(R, 1) == size(R, 2)
-                # D = factor * R' with R upper triangular: in-place TRMM.
+            n, r = size(partner)
+            q = min(n, r)
+            q == 0 && continue
+            A = view(work, 1:n, 1:r)
+            copyto!(A, partner)
+            LAPACK.geqrt!(A, view(tau, 1:min(36, q), 1:q))
+            dest = view(C, :, (off+1):(off+q))
+            if q == r
                 copyto!(dest, factor)
-                BLAS.trmm!('R', 'U', 'T', 'N', 1.0, R, dest)
+                BLAS.trmm!('R', 'U', 'T', 'N', 1.0, view(work, 1:r, 1:r), dest)
             else
-                mul!(dest, factor, R')
+                mul!(dest, factor, transpose(triu!(work[1:q, 1:r])))
             end
-            off += r
+            off += q
         end
     end
     wi > 0 && copyto!(view(C, :, (off+1):w), inherited)
