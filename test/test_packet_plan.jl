@@ -116,4 +116,42 @@ end
         @test H2Matrices.multi_workspace_bytes(P,1)==0
         @test H2Matrices.multi_workspace_bytes(P,9)>0
     end
+    # Multi-vector products are also bitwise independent of the worker count.
+    C.global_index=true;core=H2CompactMatvecPlan(C)
+    P1=H2PacketMatvecPlan(core;workers=1);P4=H2PacketMatvecPlan(core;workers=4)
+    Xr=randn(rng,158,7);Zr=randn(rng,203,7)
+    @test P4*Xr==P1*Xr
+    @test adjoint(P4)*Zr==adjoint(P1)*Zr
+end
+@testset "Packet plans without couplings or without near field" begin
+    rng=MersenneTwister(922)
+    X=[Point2D(rand(rng),rand(rng)) for _ in 1:40]
+    K=KernelMatrix(X,X) do x,y
+        exp(-sum(abs2,x-y))
+    end
+    # One leaf: the whole operator is a single dense block.
+    T=ClusterTree(copy(X),GeometricSplitter(;nmax=64))
+    H=assemble_hmatrix(K,T,T;comp=PartialACA(;rtol=1e-12),threads=false,global_index=true)
+    C=compress_hmatrix_to_h2(H;rtol=1e-11,maxrank=40,strict=true,_print=false);M=Matrix(C)
+    for workers in (1,3)
+        P=H2PacketMatvecPlan(C;workers);x=randn(rng,40);Xr=randn(rng,40,3)
+        @test isempty(P.packets) && !isempty(P.nearpackets)
+        @test P*x ≈ M*x rtol=1e-12 atol=1e-13
+        @test adjoint(P)*x ≈ M'*x rtol=1e-12 atol=1e-13
+        @test P*Xr ≈ M*Xr rtol=1e-12 atol=1e-13
+        @test adjoint(P)*Xr ≈ M'*Xr rtol=1e-12 atol=1e-13
+    end
+    # Well-separated point sets: an admissible root block, no near field.
+    Yp=[Point2D(5+rand(rng),rand(rng)) for _ in 1:30]
+    K2=KernelMatrix((x,y)->inv(norm(x-y)),X,Yp)
+    rt=ClusterTree(copy(X),GeometricSplitter(;nmax=8));ct=ClusterTree(copy(Yp),GeometricSplitter(;nmax=8))
+    H2=assemble_hmatrix(K2,rt,ct;comp=PartialACA(;rtol=1e-12),threads=false,global_index=true)
+    C2=compress_hmatrix_to_h2(H2;rtol=1e-11,maxrank=40,strict=true,_print=false);M2=Matrix(C2)
+    for workers in (1,3)
+        P=H2PacketMatvecPlan(C2;workers);x=randn(rng,30);z=randn(rng,40)
+        @test isempty(P.nearpackets)
+        @test P*x ≈ M2*x rtol=1e-11 atol=1e-13
+        @test adjoint(P)*z ≈ M2'*z rtol=1e-11 atol=1e-13
+        @test P*[x x] ≈ M2*[x x] rtol=1e-11 atol=1e-13
+    end
 end
