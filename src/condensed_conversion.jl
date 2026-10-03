@@ -290,7 +290,11 @@ function _square_factor!(Pt::Matrix{Float64})
     w, n = size(Pt)
     w <= n && return Pt
     LAPACK.geqrt!(Pt, Matrix{Float64}(undef, min(36, n), n))
-    return triu!(Pt[1:n, 1:n])
+    R = view(Pt, 1:n, 1:n)    # in place: zero the Householder vectors below R
+    for j in 1:n, i in (j+1):n
+        R[i, j] = 0.0
+    end
+    return R
 end
 
 function _mark_identity_embedding!(cb::ClusterBasis, kc::Int, kinds::_ConversionBases)
