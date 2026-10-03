@@ -145,14 +145,15 @@ function _active_matrix_t(cb::ClusterBasis, ctx::_BasisBuildContext, inherited_t
     return Ct
 end
 
-# Exact width condensation in place: returns (Lt, triangular) with
-# Lt'*Lt == Ct'*Ct (up to rounding). For Ct taller than wide, Lt is the m × m
-# upper-triangular R of Ct = Q*R (a view into Ct, lower part zeroed).
+# Exact width condensation: returns (Lt, triangular) with Lt'*Lt == Ct'*Ct (up
+# to rounding). For Ct taller than wide, Lt is the m × m upper-triangular R of
+# Ct = Q*R. Lt stays alive while the whole subtree is processed, so R is copied
+# out of a much taller Ct (whose Householder rows can then be collected).
 function _condense_active_t!(Ct::Matrix{Float64})
     w, m = size(Ct)
     w <= m && return Ct, false
     LAPACK.geqrt!(Ct, Matrix{Float64}(undef, min(36, m), m))
-    R = view(Ct, 1:m, 1:m)
+    R = 4w > 5m ? Ct[1:m, 1:m] : view(Ct, 1:m, 1:m)
     for j in 1:m, i in (j+1):m
         R[i, j] = 0.0
     end
