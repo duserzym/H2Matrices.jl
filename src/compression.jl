@@ -320,7 +320,8 @@ function _build_adaptive_basis_recursive!(
     seed = isempty(inherited) ? nothing :
         Matrix(transpose(reduce(hcat, [M[(first(r)-first(ar)+1):(last(r)-first(ar)+1), :] for (M, ar) in inherited])))
     ctx = _BasisBuildContext(_node_entries(data, cb, kinds), rtol, maxrank, is_row, capped_residuals,
-                             ReentrantLock(), kinds, _condensed_spawn_min(threads), nothing)
+                             ReentrantLock(), kinds, _condensed_spawn_min(threads), nothing,
+                             _BasisSchedule(cb, length(kinds.kind)))
     _condensed_basis!(cb, seed, ctx)
     return _materialize_identity_embeddings!(cb, kinds)
 end

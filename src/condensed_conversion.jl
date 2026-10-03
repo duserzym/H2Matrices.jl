@@ -63,6 +63,7 @@ struct _BasisBuildContext{K,F}
     kinds::K
     spawn_min::Int   # spawn child subtrees for clusters at least this large
     fill::F          # `nothing` or an `_EagerFill` run as nodes become final
+    sched::Any       # `_BasisSchedule` of this build
 end
 
 # Node-indexed factor lists from a Dict keyed by `objectid(cluster)`.
@@ -359,34 +360,109 @@ function _transfer_basis!(cb::ClusterBasis, Lt, triangular::Bool, ctx::_BasisBui
     return cb
 end
 
-function _condensed_basis!(cb::ClusterBasis, inherited_t, ctx::_BasisBuildContext)
+# Continuation-style traversal: a node's transfer step runs in whichever task
+# completes its last child (atomic countdown), so no task ever blocks waiting
+# for children. Blocked parents would keep their stacks and frames alive across
+# the whole subtree; instead each pending parent only keeps its condensed factor
+# in a per-node slot. The arithmetic per node, and hence the result, does not
+# depend on the schedule.
+struct _PendingTransfer
+    Lt::Any
+    triangular::Bool
+    remaining::Threads.Atomic{Int}
+end
+
+mutable struct _BasisSchedule
+    root::Any
+    pending::Vector{Any}            # by node index: _PendingTransfer or nothing
+    done::Threads.Event
+    inflight::Threads.Atomic{Int}   # spawned tasks not yet finished
+    error::Any                      # first exception, or nothing
+    lock::ReentrantLock
+end
+
+_BasisSchedule(root, nnodes::Int) =
+    _BasisSchedule(root, Any[nothing for _ in 1:nnodes], Threads.Event(), Threads.Atomic{Int}(0),
+                   nothing, ReentrantLock())
+
+function _schedule_failed!(sched::_BasisSchedule, err)
+    lock(sched.lock) do
+        sched.error === nothing && (sched.error = err)
+    end
+    notify(sched.done)
+end
+
+function _spawn_node!(child, inherited_t, ctx)
+    sched = ctx.sched
+    Threads.atomic_add!(sched.inflight, 1)
+    Threads.@spawn try
+        _start_node!(child, inherited_t, ctx)
+    catch err
+        _schedule_failed!(sched, err)
+    finally
+        Threads.atomic_sub!(sched.inflight, 1)
+    end
+    return nothing
+end
+
+function _start_node!(cb::ClusterBasis, inherited_t, ctx::_BasisBuildContext)
+    ctx.sched.error === nothing || return nothing
     Ct = _active_matrix_t(cb, ctx, inherited_t)
     inherited_t = nothing
     if isleaf(cb)
         _leaf_basis!(cb, Ct, ctx)
-        return _node_ready!(ctx.fill, cb)
+        _node_ready!(ctx.fill, cb)
+        return _child_done!(cb, ctx)
     end
     Lt, triangular = Ct === nothing ? (nothing, false) : _condense_active_t!(Ct)
+    Ct = nothing
+    ctx.sched.pending[ctx.kinds.index[cb]] =
+        _PendingTransfer(Lt, triangular, Threads.Atomic{Int}(length(cb.children)))
     irange = index_range(cb.cluster)
-    # Children inherit column blocks of Lt (views; Lt stays alive until they
-    # finish). Columns of an upper-triangular R vanish below their own index:
-    # dropping these zero rows leaves every child's Gram matrix unchanged.
-    function sub(child)
-        Lt === nothing && return nothing
+    spawn = length(cb) >= ctx.spawn_min && length(cb.children) > 1
+    for child in cb.children
+        # Children inherit column blocks of Lt (views). Columns of an
+        # upper-triangular R vanish below their own index: dropping these zero
+        # rows leaves every child's Gram matrix unchanged.
         cols = _local_rows(child, irange)
-        return triangular ? view(Lt, 1:last(cols), cols) : view(Lt, :, cols)
+        inherited = Lt === nothing ? nothing :
+            triangular ? view(Lt, 1:last(cols), cols) : view(Lt, :, cols)
+        spawn ? _spawn_node!(child, inherited, ctx) : _start_node!(child, inherited, ctx)
     end
-    if length(cb) >= ctx.spawn_min && length(cb.children) > 1
-        tasks = [Threads.@spawn(_condensed_basis!(child, sub(child), ctx)) for child in cb.children[2:end]]
-        _condensed_basis!(cb.children[1], sub(cb.children[1]), ctx)
-        foreach(fetch, tasks)
-    else
-        for child in cb.children
-            _condensed_basis!(child, sub(child), ctx)
-        end
+    return nothing
+end
+
+function _child_done!(cb::ClusterBasis, ctx::_BasisBuildContext)
+    sched = ctx.sched
+    if cb === sched.root
+        notify(sched.done)
+        return nothing
     end
-    _transfer_basis!(cb, Lt, triangular, ctx)
-    return _node_ready!(ctx.fill, cb)
+    parent = cb.parent
+    i = ctx.kinds.index[parent]
+    p = sched.pending[i]::_PendingTransfer
+    Threads.atomic_sub!(p.remaining, 1) == 1 || return nothing
+    sched.pending[i] = nothing
+    _transfer_basis!(parent, p.Lt, p.triangular, ctx)
+    _node_ready!(ctx.fill, parent)
+    return _child_done!(parent, ctx)
+end
+
+# Build the nested basis of the subtree `root` (inherited factor `seed`).
+function _condensed_basis!(root::ClusterBasis, seed, ctx::_BasisBuildContext)
+    sched = ctx.sched
+    sched.root = root
+    try
+        _start_node!(root, seed, ctx)
+    catch err
+        _schedule_failed!(sched, err)
+    end
+    wait(sched.done)
+    while sched.inflight[] > 0
+        yield()
+    end
+    sched.error === nothing || throw(sched.error)
+    return root
 end
 
 function _materialize_identity_embeddings!(root::ClusterBasis, kinds::_ConversionBases)
@@ -557,8 +633,9 @@ function _compress_hmatrix_to_h2_condensed(hmat::HMatrix; rtol, maxrank, strict,
     capped = Float64[]
     lk = ReentrantLock()
     spawn_min = _condensed_spawn_min(threads)
-    rctx = _BasisBuildContext(data, rtol, maxrank, true, capped, lk, kinds, spawn_min, fill)
-    cctx = _BasisBuildContext(data, rtol, maxrank, false, capped, lk, kinds, spawn_min, fill)
+    nn = length(kinds.kind)
+    rctx = _BasisBuildContext(data, rtol, maxrank, true, capped, lk, kinds, spawn_min, fill, _BasisSchedule(rb, nn))
+    cctx = _BasisBuildContext(data, rtol, maxrank, false, capped, lk, kinds, spawn_min, fill, _BasisSchedule(cb, nn))
     try
         if threads
             # Row and column bases are independent.
