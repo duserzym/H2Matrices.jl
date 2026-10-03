@@ -1,5 +1,5 @@
 # ════════════════════════════════════════════════════════════════════
-# Condensed (and optionally threaded) H → H² basis construction
+# Condensed, threaded and consuming H → H² conversion
 # ════════════════════════════════════════════════════════════════════
 #
 # The adaptive basis of a cluster t is the dominant left singular subspace of
@@ -22,9 +22,15 @@
 # non-leaf stores the identity embedding of its children's coefficients. This is
 # an exact change of coordinates; couplings are projected in the same
 # coordinates, so the represented operator is unchanged up to rounding.
+#
+# Scheduling and memory: nodes are processed in continuation style (a parent's
+# transfer runs in the task finishing its last child), couplings are formed as
+# soon as both of their cluster bases are final, and a consuming conversion
+# releases each H-matrix block right after its coupling exists. Every node's and
+# block's arithmetic is independent of the schedule, so results are bitwise
+# independent of the number of threads.
 
-const _BASIS_GENERAL = 0x00
-const _BASIS_IDENTITY = 0x01   # leaf V == I, or non-leaf identity embedding
+const _BASIS_IDENTITY = 0x01   # leaf V == I, or non-leaf identity embedding (else 0x00)
 
 # Conversion-local node classification (not stored in ClusterBasis, so later
 # mutations such as recompression cannot leave stale flags behind).
@@ -44,7 +50,6 @@ function _ConversionBases(roots::ClusterBasis{N,T}...) where {N,T}
     return _ConversionBases{N,T}(index, zeros(UInt8, n), fill(false, n))
 end
 
-_basis_kind(k::_ConversionBases, cb) = k.kind[k.index[cb]]
 _full_identity(k::_ConversionBases, cb) = k.full[k.index[cb]]
 
 const _RkEntry = NamedTuple{(:A,:B),Tuple{Matrix{Float64},Matrix{Float64}}}
