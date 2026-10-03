@@ -20,9 +20,9 @@ h2 = assemble_h2matrix_adaptive(K;
 | `maxrank` | Maximum retained basis rank | Accuracy if the required rank exceeds the cap |
 | `strict=true` | Reject a cap that violates a requested local threshold | Mesh, path or whole-campaign convergence |
 | `coupling_rtol` | Additional local coupling SVD truncation when requested | The original stored operator's accuracy without new checks |
-| `coupling_scale=:global` | Coupling truncation relative to the largest stored block norm instead of each block's own norm | A global error bound |
-| `coupling_precision=Float32` or `Float16` | Float32 (and scaled Float16) storage of small retained coupling components, Float64 arithmetic | Accuracy without new checks |
-| `passthrough=true` | Exact folding of weakly compressing transfers into couplings (compact/packet plans) | Nothing beyond rounding; it adds no tolerance |
+| `coupling_scale=:global` | Coupling truncation relative to the largest stored block norm instead of each block's own norm (requires `coupling_rtol`) | A global error bound |
+| `coupling_precision=Float32` or `Float16` | Float32/Float16 storage (range-scaled) of small retained coupling components, Float64 arithmetic (requires `coupling_rtol`) | Accuracy without new checks; the rounding error is estimated, not bounded |
+| `passthrough=true` | Exact folding of weakly compressing transfers into couplings (compact/packet plans) | Nothing beyond rounding without `coupling_rtol`; with it, the folded couplings are truncated differently |
 | `nmax`, admissibility | Tree/block partitioning and resulting ranks/work | A mesh-independent best configuration |
 | `threads=true` | Builds the intermediate H-matrix leaves on all Julia threads; the result equals the serial build (`K` must allow concurrent `getblock!`) | Any accuracy change |
 | `comp` | Replaces the default `PartialACA(; rtol=aca_rtol)` H-block compressor | Accuracy of the substitute compressor |

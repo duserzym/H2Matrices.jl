@@ -121,13 +121,13 @@ Above the saturated levels, a parent basis often compresses its children only mi
 
 that is, when this stores fewer numbers. Applying the same rule with `D=|t|` places nearly saturated leaves in physical coordinates. Row decisions are made bottom-up with the column widths of the identity rule, then column decisions with the final row widths; iterating these decisions changed the PLAG066 total by less than 0.1 MB. Like implicit identities, this is exact up to floating-point rounding.
 
-| Operator (`eta=3`, ACA/basis `1e-11/1e-10`) | Compact packet storage | With `passthrough=true` | Forward/adjoint ms (4 workers) |
-|---|---:|---:|---|
-| PLAG066 (6,028 nodes) | 302.75 MB | 288.08 MB | 3.48/2.73 → 2.86/2.25 |
-| PLAG036 (12,415 nodes) | 714.85 MB | 661.02 MB | 8.94/7.38 → 7.47/5.87 |
-| PLAG022 (17,875 nodes) | 1511.48 MB | 1400.01 MB | 18.86/15.58 → 14.74/12.38 |
+| Operator (`eta=3`, ACA/basis `1e-11/1e-10`) | Compact packet storage | With `passthrough=true` |
+|---|---:|---:|
+| PLAG066 (6,028 nodes) | 302.75 MB | 288.08 MB |
+| PLAG036 (12,415 nodes) | 714.85 MB | 661.02 MB |
+| PLAG022 (17,875 nodes) | 1511.48 MB | 1400.01 MB |
 
-Products changed by at most `1.4e-15` relative to the original plan, and errors against exact dense products were unchanged. Timings are medians of interleaved runs in one process on a shared machine.
+Products changed by at most `1.4e-15` relative to the original plan, and errors against exact dense products were unchanged. With the packet engine described below (four workers, interleaved medians in one process on a shared machine), forward/adjoint products took 1.90/1.72 ms against 2.00/1.80 ms on PLAG066 and 4.68/3.86 ms against 4.81/4.29 ms on PLAG036: as products are close to bandwidth bound, pass-through saves time roughly in proportion to the stored numbers it removes. (Against the earlier v0.1.3 packet engine the saving was 16-22%.)
 
 ## Pack interactions into larger contiguous products
 
@@ -148,6 +148,8 @@ Q_e=\begin{bmatrix}D_{\tau_1 e}\\ D_{\tau_2 e}\\ \vdots\end{bmatrix}.
 ```
 
 Each packet is then applied by a single long-column kernel in both directions, so the near field and the couplings need no dot products over very short columns (a 32-row near-field leaf block applied transposed ran at about 13-25 GB/s on one core, versus 60-70 GB/s for long columns); the upward pass still applies transposed transfer matrices whose columns have the child rank as length. Fused kernels read input segments in place instead of gathering them and replace BLAS GEMV. On the same packets the fused loops were measured at about 66-70 GB/s against 53-60 GB/s for GEMV; the gap depends on packet shape and run.
+
+A coupling packet stores its numbers in up to three parts by storage precision: Float64, and the Float32 and Float16 tiers of mixed-precision couplings (below). Within a part, a segment is either direct (the coupling block, or its dense Float64 or Float32 part) or factored, `L*Diagonal(c)*R'`: `L` lives in the part matrix, the right factor `R` and the optional power-of-two scales `c` are kept per segment, and the inner vector `R'*x̂_σ` (forward) or `L'*ŷ_τ` (transposed) goes through per-worker scratch. Every part is applied in Float64 arithmetic. Each coupling keeps one slot per column coefficient whatever parts it has, so the slot reduction below does not change; packets with direct Float64 segments only run the plain path bitwise unchanged. Pass-through basis nodes (above) copy child coefficients in the upward pass and add them back in the downward pass.
 
 ## Parallelize with explicit ownership of writes
 
@@ -189,7 +191,7 @@ Packet plans keep factorized couplings as factors: left factors join the packet 
 
 A block-relative coupling tolerance resolves weak blocks to a much smaller absolute error than strong ones. With `coupling_scale=:global`, singular values of the compact couplings are discarded below `coupling_rtol` times the largest stored block norm, including the near field. Because many couplings of the saturated levels are physical-coordinate blocks, this acts like a global absolute truncation of those blocks, while the nested bases keep their `rtol`.
 
-`coupling_precision=Float32` additionally stores each retained component whose singular value is below `coupling_rtol*scale/eps(Float32)` in Float32, as factors or as a dense remainder, and keeps the larger components in Float64. `coupling_precision=Float16` adds a third tier: components below `coupling_rtol*scale/eps(Float16)` become Float16 factors with exact power-of-two column scales. The per-component rounding error is then comparable to the discarded components. Products load the stored low-precision numbers and accumulate in Float64, so the adjoint remains the exact transpose of the stored operator up to Float64 rounding; one-worker products remain allocation free.
+`coupling_precision=Float32` additionally stores each retained component whose singular value is below `coupling_rtol*scale/eps(Float32)` in Float32, as factors or as a dense remainder, and keeps the larger components in Float64. `coupling_precision=Float16` adds a third tier: components below `coupling_rtol*scale/eps(Float16)` become Float16 factors. Factor columns are scaled by exact powers of two whenever a column would leave the normal Float32 range (always for Float16), so the tiers keep their relative precision for operators of any magnitude, and a Float32 dense remainder is used only when its entries are within the Float32 range; ordinary operators such as the BEM matrices here need no Float32 scales. Rounding a component `σ u v'` to `T` perturbs it by about `2 eps(T) σ`, which is at most about `2 coupling_rtol*scale` in each tier; the rounding errors of a block's reduced-precision components add up, so this is an estimate, not a bound, and the realized rounding error can exceed the realized truncation error when singular values decay fast. Products load the stored low-precision numbers and accumulate in Float64, so the adjoint remains the exact transpose of the stored operator up to Float64 rounding; one-worker products remain allocation free.
 
 These are approximations and require the same physical validation as any relaxed tolerance; the measured product errors in the next table were obtained against exact dense products and are not torque errors. Packet plans with four workers, `nmax=32`, ACA `1e-11`:
 
@@ -208,7 +210,16 @@ These are approximations and require the same physical validation as any relaxed
 | PLAG022 | `eta=1.5`, `rtol=5e-11`, `passthrough`, global `coupling_rtol=1.5e-11`, Float32 | 916.00 MB | 2.81e-11 / 2.57e-11 |
 | PLAG022 | `eta=1.5`, `rtol=5e-11`, `passthrough`, global `coupling_rtol=1e-11`, Float16 | 853.52 MB | 2.76e-11 / 2.40e-11 |
 
-In the same runs, forward/adjoint packet products of the Float32 variant took 2.84/2.14 ms (PLAG066), 7.64/5.97 ms (PLAG036) and 13.17/10.85 ms (PLAG022), against 3.59/2.86, 8.94/7.38 and 18.86/15.58 ms for the baseline; build time fell by 11-17% because `eta=1.5` makes the basis conversion cheaper. Dense storage is 290.69, 1233.0 and 2556.1 MB for the three grains.
+Storage and errors were reproduced on the current packet engine to the reported digits for PLAG066 and PLAG036 (PLAG022 was measured with the earlier engine). Forward/adjoint products with four workers, interleaved medians in one process on a shared machine (milliseconds; PLAG066 / PLAG036):
+
+| Configuration | One worker | Four workers | Eight workers (PLAG066) | Per vector, 9 right-hand sides, four workers |
+|---|---|---|---|---|
+| core packet plan, `eta=3` | 5.80/5.19 / 14.18/12.97 | 2.00/1.80 / 4.81/4.29 | 1.88/1.76 | 0.62/0.55 / 1.35/1.24 |
+| Float64 global truncation (258.55 / 628.53 MB) | 5.40/5.10 / 12.82/12.23 | 1.84/1.69 / 4.20/3.96 | 1.61/1.55 | 0.59/0.52 / 1.24/1.18 |
+| Float32 (190.24 / 497.86 MB) | 6.07/6.16 / 14.25/14.73 | 1.84/1.84 / 4.25/4.28 | 1.49/1.49 | 0.72/0.66 / 1.53/1.47 |
+| Float16 (179.14 / 474.95 MB) | 7.59/7.35 / 17.18/17.28 | 2.17/2.06 / 4.94/4.98 | 1.65/1.68 | 0.79/0.73 / 1.70/1.65 |
+
+Reduced-precision parts store fewer bytes per number but convert every number to Float64 before multiplying it, and factored segments add short inner products. They are therefore compute bound rather than bandwidth bound: with four workers the Float32 variant runs about as fast as the core plan (12% faster to 2% slower) and the Float16 variant 3-16% slower; with one worker they are up to 19% and 42% slower. They gain with more workers (eight workers: 21% and 12% faster forward products than the core plan on PLAG066). Products with several right-hand sides, which are compute bound anyway, take 13-33% longer per vector. Building the compact plan adds threaded SVDs of all couplings (1.0-1.1 s on PLAG066, 2.2-2.3 s on PLAG036; a Frobenius-norm bound skips most spectral norms of the global scale, giving the same value); because `eta=1.5` makes ACA and the conversion cheaper, H-matrix assembly, conversion and plan took 3.7 s against 2.9 s for the core build on PLAG066 and 12.2 s against 13.0 s on PLAG036. The build-time memory peak remains the conversion (H-matrix plus H² matrix); with `consume=true` the plan stage stays below it. Dense storage is 290.69, 1233.0 and 2556.1 MB for the three grains.
 
 The dense PLAG066 matrix needs 290.69 MB, so only the mixed-precision variants compress it substantially at this accuracy. The physics of the kernel limits compression: at relative accuracy near `1e-11` the far field of clusters below roughly 200 points remains full rank even for `eta=0.5`, so much of the operator is stored as dense or physical-coordinate blocks whatever the admissibility.
 

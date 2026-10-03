@@ -38,6 +38,23 @@
   packet plans, streaming the operator once per block of up to 16 right-hand
   sides, `multi_workspace_bytes` and `release_multi_workspace!` (frees or
   shrinks the multi-RHS scratch kept by the plan).
+- `H2CompactMatvecPlan(h2; passthrough=true)`: internal basis nodes whose
+  transfer matrices barely compress and serve few couplings use their
+  children's concatenated coefficients; their transfers are folded into
+  couplings and parent transfers (exact up to rounding; less storage and
+  faster products). Packet plans copy those coefficients in the upward and
+  downward passes.
+- Compact-plan coupling truncation gains `coupling_scale=:global` (threshold
+  relative to the largest stored block norm) and `coupling_precision=Float32`
+  or `Float16` (small retained components stored in reduced precision with
+  exact power-of-two column scales where needed, Float64 arithmetic, so the
+  adjoint stays the exact transpose of the stored operator). Both qualify
+  `coupling_rtol` and are rejected without it. These are approximations.
+- Packet plans keep factorized couplings as factors (`keep_factors=true`)
+  and store mixed-precision couplings in per-precision packet parts.
+  `H2PacketMatvecPlan(h2; consume=true, compact options...)` and
+  `H2CompactMatvecPlan(h2; consume=true)` release the source blocks while the
+  plan is built; the plans are identical to non-consuming builds.
 
 ## 0.1.3
 
