@@ -100,8 +100,8 @@ which is an approximation and requires separate application validation.
 With `coupling_scale=:block` (default) singular values below `coupling_rtol`
 times the coupling's own largest singular value are discarded. With
 `coupling_scale=:global` the threshold is `coupling_rtol` times the largest
-singular value over all stored couplings, so weak blocks are not resolved to
-a tighter absolute accuracy than strong ones. A coupling is factorized only
+spectral norm over all stored blocks (couplings and near field), so weak
+blocks are not resolved to a tighter absolute accuracy than strong ones. A coupling is factorized only
 when its factors use less storage than the coupling itself.
 The plan retains numerical data but not the source operator or unused bases.
 Its adjoint applies the same stored approximation. Use one plan per concurrent
@@ -192,9 +192,25 @@ function H2CompactMatvecPlan(h2::H2Matrix;coupling_rtol::Union{Nothing,Float64}=
     couplings=if coupling_rtol===nothing
         exact
     else
-        norms=coupling_scale===:global ? _threaded_map(b->isempty(b.S) ? 0. : opnorm(b.S),Float64,exact) : Float64[]
-        scale=coupling_scale===:global ? maximum(norms;init=0.) : nothing
-        _threaded_map(b->_factor_plan_coupling(b.S,b.row,b.col,coupling_rtol,scale),_LowRankPlanCoupling,exact)
+        scale=if coupling_scale===:global
+            # Largest stored block norm (near field included) as the operator scale.
+            max(maximum(_threaded_map(b->isempty(b.S) ? 0. : opnorm(b.S),Float64,exact);init=0.),
+                maximum(_threaded_map(b->isempty(b.D) ? 0. : opnorm(b.D),Float64,dense);init=0.))
+        else
+            nothing
+        end
+        # Release each transformed coupling once factorized to bound transient memory.
+        out=Vector{_LowRankPlanCoupling}(undef,length(exact));next=Threads.Atomic{Int}(1)
+        @sync for _ in 1:min(Threads.nthreads(),max(length(exact),1))
+            Threads.@spawn while true
+                i=Threads.atomic_add!(next,1)
+                i>length(exact) && break
+                b=exact[i]
+                out[i]=_factor_plan_coupling(b.S,b.row,b.col,coupling_rtol,scale)
+                exact[i]=_PlanCoupling(zeros(0,0),b.row,b.col)
+            end
+        end
+        out
     end
     rp=h2.global_index ? collect(loc2glob(h2.row_basis.cluster)) : collect(1:size(h2,1))
     cp=h2.global_index ? collect(loc2glob(h2.col_basis.cluster)) : collect(1:size(h2,2))
