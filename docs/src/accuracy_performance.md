@@ -223,7 +223,7 @@ Each coupling packet is rotated to its left singular basis; rows of small singul
 
 The plan runs on the packet-plan engine with the same kernels: forward and adjoint products apply the same stored values (the adjoint is an exact transpose), products are bitwise independent of the worker count, several right-hand sides are supported, and `precision_rtol=0` reproduces `H2PacketMatvecPlan` bitwise. Construction is deterministic under threads. From an H² matrix the plan accepts the compact options `passthrough`, `coupling_rtol` and `coupling_scale` (with `consume=true` the source blocks are released while the plan is built). Pass-through composes exactly and is recommended. Factorized couplings from `coupling_rtol` are multiplied out in the packets, so they bring no storage saving here; `coupling_precision` is a different reduced-precision storage and is rejected.
 
-Measured on the PLAG066/PLAG036 boundary operators (nb 6028/12415; `nmax=32`, `aca_rtol=1e-11`, `rtol=1e-10`, strict ranks; largest relative forward/adjoint errors against exact dense products):
+Measured on the PLAG066/PLAG036 boundary operators (nb 6028/12415; `nmax=32`, `aca_rtol=1e-11`, `rtol=1e-10`, strict ranks; largest relative forward/adjoint errors against exact dense products over four reference vectors -- three Gaussian and one smooth. Smooth inputs and single columns see errors 1.5-4.5x larger, so read these as comparative levels, not bounds):
 
 | Configuration | Operator MB (PLAG066 / PLAG036) | Error, PLAG066 | Error, PLAG036 |
 |---|---|---|---|
@@ -241,7 +241,7 @@ Single-vector products read fewer bytes and are memory-bound, so they get faster
 
 ## Choose a configuration
 
-All of the following use one BLAS thread, `nmax=32`, `aca_rtol=1e-11`, `strict=true` and a rank cap that is not reached, and meet the validated product-error levels on PLAG066 and PLAG036 (see the tables above and in [How the advances work](advances.md#Compare-the-variants)). Only the first two leave the validated approximation unchanged; the others need the application's own validation.
+All of the following use one BLAS thread, `nmax=32`, `aca_rtol=1e-11`, `strict=true` and a rank cap that is not reached, and meet the validated product-error levels on PLAG066 and PLAG036 as measured by the four-reference-vector maximum and the Frobenius (RMS) error (see the tables above and in [How the advances work](advances.md#Compare-the-variants)). That is not a worst-case statement: on PLAG066 the `eta=1.5` rows have a spectral-norm error about 4% above the validated operator's. Only the first row leaves the validated approximation unchanged (pass-through is an exact change of representation); every other row is a different approximation and needs the application's own validation.
 
 | Goal | Settings | PLAG066 / PLAG036 MB |
 |---|---|---|

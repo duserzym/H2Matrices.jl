@@ -234,7 +234,7 @@ The mixed packets are a second packet type of the same engine: `H2PacketMatvecPl
 
 ## Compare the variants
 
-Same-process measurements on the PLAG066 and PLAG036 boundary operators, all from the same H² matrices (ACA `1e-11`, `nmax=32`, strict ranks, consuming threaded conversion) and packet engine. Errors are the largest relative errors of forward/adjoint products against exact dense products over four reference vectors; the validated `eta=3` operator gives 1.850e-11/1.717e-11 (PLAG066) and 7.705e-11/7.601e-11 (PLAG036). Product times are medians of 15-21 interleaved rounds with one BLAS thread on a 14-core M4 Pro (load average 2-4); the plan time excludes compilation and building from the H² matrix.
+Same-process measurements on the PLAG066 and PLAG036 boundary operators, all from the same H² matrices (ACA `1e-11`, `nmax=32`, strict ranks, consuming threaded conversion) and packet engine. Errors are the largest relative errors of forward/adjoint products against exact dense products over four reference vectors (three Gaussian, one smooth; smooth inputs and single columns see errors 1.5-4.5x larger, so these are comparative levels, not bounds); the validated `eta=3` operator gives 1.850e-11/1.717e-11 (PLAG066) and 7.705e-11/7.601e-11 (PLAG036). Product times are medians of 15-21 interleaved rounds with one BLAS thread on a 14-core M4 Pro (load average 2-4); the plan time excludes compilation and building from the H² matrix.
 
 | Variant | Exact? | PLAG066 MB | PLAG066 error | PLAG036 MB | PLAG036 error |
 |---|---|---:|---|---:|---|

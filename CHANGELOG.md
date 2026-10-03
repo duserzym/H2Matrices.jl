@@ -96,8 +96,13 @@
   coupling truncation 258.5/628.5 MB; with Float16 coupling tiers
   179.1/474.9 MB; mixed-precision packets on pass-through `eta=1.5` bases
   211.4/517.2 MB (`format48=true`) under the 1e-13 bound. All of these meet
-  the validated product-error levels against exact dense products; see
-  `docs/src/advances.md` for timings and the trade-offs.
+  the validated product-error levels against exact dense products as measured
+  by the four-reference-vector maximum and the Frobenius error (not a
+  worst-case bound: on PLAG066 the `eta=1.5` variants have a spectral-norm
+  error about 4% above the validated operator's). Only pass-through is an
+  exact representation change; the others are different approximations that
+  need application validation. See `docs/src/advances.md` for timings and the
+  trade-offs.
 
 ## 0.1.3
 
