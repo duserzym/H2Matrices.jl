@@ -421,17 +421,16 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
     Threads.@threads :dynamic for t in 1:np
         blocks = packet_blocks(t); k = ks[t]; N = Ns[t]; r1 = n64[t]; rm = r1 + r48[t]
         nref = r32[t] > 0 ? rm : r1
-        hv = Float64[]; tau = Float64[]; Q = zeros(0, 0)
+        hv = Float64[]; tau = Float64[]; U = zeros(0, 0); A = view(U, :, 1:0)
         if rotated[t]
             U = reverse!(eigen!(gram(blocks, k); alg=LinearAlgebra.DivideAndConquer()).vectors; dims=2)
             if !explicitU[t]
-                Uabs[t] = U; Q = U
+                Uabs[t] = U
             else
                 # Householder QR of the leading singular vectors (in place): the
                 # spans of Q[:, 1:j] and U[:, 1:j] agree for every j <= nref.
                 A, tau = LAPACK.geqrf!(view(U, :, 1:nref))
                 hv = reduce(vcat, [A[i+1:k, i] for i in 1:nref]; init=Float64[])
-                Q = LAPACK.ormqr!('L', 'N', A, tau, Matrix{Float64}(I, k, k))
             end
         end
         hirows = _InterleavedRows{Float64}(undef, r1, N)
@@ -439,7 +438,13 @@ function H2MixedPacketMatvecPlan(p::H2CompactMatvecPlan; workers::Int=1, precisi
         off = 0; c = 0.0; e = 0.0
         wbuf = rotated[t] ? Matrix{Float64}(undef, k, maximum(B -> size(B, 2), blocks)) : zeros(0, 0)
         for B in blocks
-            Wb = rotated[t] ? mul!(view(wbuf, :, 1:size(B, 2)), Q', B) : B
+            Wb = if !rotated[t]
+                B
+            elseif !explicitU[t]
+                mul!(view(wbuf, :, 1:size(B, 2)), U', B)
+            else
+                LAPACK.ormqr!('L', 'T', A, tau, copyto!(view(wbuf, :, 1:size(B, 2)), B))   # Qᵀ B, Q never formed
+            end
             hiW = view(Wb, 1:r1, :); midW = view(Wb, r1+1:rm, :); loW = view(Wb, rm+1:k, :)
             _put_block!(hirows, hiW, off); _put_block!(midrows, midW, off); _put_block!(lorows, loW, off)
             c += _U32^2 * sum(abs2, loW) + length(loW) * 2.0^-300 + _U48^2 * sum(abs2, midW)
