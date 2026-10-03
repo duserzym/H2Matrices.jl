@@ -115,6 +115,17 @@ end
         @test fetch(g) ≈ M'*Zr rtol=1e-10 atol=1e-11
         @test H2Matrices.multi_workspace_bytes(P,1)==0
         @test H2Matrices.multi_workspace_bytes(P,9)>0
+        # Releasing the workspace frees it and shrinks it on the next use.
+        R=copy(P);@test multi_workspace_bytes(R)==0
+        X33=randn(rng,158,33);Y33=R*X33
+        wide=multi_workspace_bytes(R)
+        @test wide==multi_workspace_bytes(R,33)>multi_workspace_bytes(R,3)
+        @test release_multi_workspace!(R)==wide && multi_workspace_bytes(R)==0
+        @test R*Xr==P*Xr && adjoint(R)*Zr==adjoint(P)*Zr
+        @test multi_workspace_bytes(R)==multi_workspace_bytes(R,4)
+        @test R*X33==Y33
+        @test release_multi_workspace!(R)>0 && release_multi_workspace!(R)==0
+        x1=randn(rng,158);@test R*x1==P*x1
     end
     # Multi-vector products are also bitwise independent of the worker count.
     C.global_index=true;core=H2CompactMatvecPlan(C)

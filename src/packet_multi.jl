@@ -243,13 +243,36 @@ LinearAlgebra.mul!(Y::AbstractMatrix,p::TransposedPacketH2Plan,X::AbstractMatrix
 Base.:*(p::Union{H2PacketMatvecPlan,TransposedPacketH2Plan},X::AbstractMatrix)=mul!(zeros(size(p,1),size(X,2)),p,X)
 """
     multi_workspace_bytes(plan, k)
+    multi_workspace_bytes(plan)
 
-Scratch bytes that products of `plan` with `k` right-hand sides allocate on
-first use (blocks of at most $(_MULTI_BLOCK) vectors). The workspace is kept
-by the plan and reused; `copy(plan)` starts without one.
+With `k`: scratch bytes that products of `plan` with `k` right-hand sides use
+(blocks of at most $(_MULTI_BLOCK) vectors); the workspace is allocated on
+first use, kept by the plan and reused, and grows to the widest block used.
+Without `k`: bytes of the workspace the plan currently keeps. `copy(plan)`
+starts without one; [`release_multi_workspace!`](@ref) frees it.
 """
 function multi_workspace_bytes(p::H2PacketMatvecPlan,k::Integer)
     k<=1 && return 0
     bs=cld(k,cld(k,_MULTI_BLOCK))
     8bs*(length(p.rowcoeff)+length(p.colcoeff)+length(p.rowbuffer)+length(p.colbuffer)+length(p.slots)+sum(length,p.scratch;init=0))
+end
+function multi_workspace_bytes(p::H2PacketMatvecPlan)
+    w=p.multi
+    sizeof(w.rowcoeff)+sizeof(w.colcoeff)+sizeof(w.rowbuffer)+sizeof(w.colbuffer)+sizeof(w.slots)+sum(sizeof,w.scratch;init=0)
+end
+"""
+    release_multi_workspace!(plan) -> bytes
+
+Drop the scratch that products with several right-hand sides keep in `plan`
+and return its size in bytes. The next such product allocates a workspace for
+its own block width, so this also shrinks a workspace that an earlier, wider
+product enlarged. Numerical data and single-vector scratch are unaffected.
+Like products, it must not run concurrently with another call on `plan`.
+"""
+function release_multi_workspace!(p::H2PacketMatvecPlan)
+    bytes=multi_workspace_bytes(p)
+    w=p.multi
+    w.k=0;w.rowcoeff=Float64[];w.colcoeff=Float64[];w.rowbuffer=Float64[];w.colbuffer=Float64[]
+    w.slots=Float64[];w.scratch=Vector{Float64}[]
+    bytes
 end

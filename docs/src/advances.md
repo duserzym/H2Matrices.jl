@@ -127,7 +127,7 @@ The unreleased packet layout keeps couplings as row packets, but stores the near
 Q_e=\begin{bmatrix}D_{\tau_1 e}\\ D_{\tau_2 e}\\ \vdots\end{bmatrix}.
 ```
 
-Each packet is then applied by a single long-column kernel in both directions, so no product needs dot products over very short columns (a 32-row near-field leaf block applied transposed ran at about 13-25 GB/s on one core, versus 60-70 GB/s for long columns). Fused kernels read input segments in place instead of gathering them, and replace BLAS GEMV, which reached 53-59 GB/s on the same packets compared with about 70 GB/s for the fused loops.
+Each packet is then applied by a single long-column kernel in both directions, so the near field and the couplings need no dot products over very short columns (a 32-row near-field leaf block applied transposed ran at about 13-25 GB/s on one core, versus 60-70 GB/s for long columns); the upward pass still applies transposed transfer matrices whose columns have the child rank as length. Fused kernels read input segments in place instead of gathering them and replace BLAS GEMV. On the same packets the fused loops were measured at about 66-70 GB/s against 53-60 GB/s for GEMV; the gap depends on packet shape and run.
 
 ## Parallelize with explicit ownership of writes
 
@@ -155,7 +155,7 @@ The machine was shared during these runs, so absolute times varied by about 10%.
 
 ## Apply several right-hand sides at once
 
-`mul!(Y, plan, X)` and `mul!(Y, adjoint(plan), X)` with matrices run the same phases on column-major blocks of up to 16 vectors. Register-blocked kernels reuse each packet column from cache for four vectors at a time, so the operator is streamed once per block. With four workers, the time per vector at `k = 9` was 0.6-0.7/0.6 ms forward/adjoint on PLAG066 (single products: 1.8/1.6 ms), 1.5/1.6 ms on PLAG036 and 3.1/2.9 ms on PLAG022. Multi-vector products are compute-bound rather than bandwidth-bound, so they keep scaling with workers: with eight workers on PLAG066 the time was 0.43/0.32 ms per vector. Results agree with column-wise products up to about 5e-16 relative. The workspace is allocated on first use and kept by the plan; `multi_workspace_bytes(plan, k)` reports its size (20, 43 and 67 MB for `k = 9` on the three grains).
+`mul!(Y, plan, X)` and `mul!(Y, adjoint(plan), X)` with matrices run the same phases on column-major blocks of up to 16 vectors. Register-blocked kernels reuse each packet column from cache for four vectors at a time, so the operator is streamed once per block. With four workers, the time per vector at `k = 9` was 0.6-0.7/0.6 ms forward/adjoint on PLAG066 (single products: 1.8/1.6 ms), 1.5/1.6 ms on PLAG036 and 3.1/2.9 ms on PLAG022. Multi-vector products are compute-bound rather than bandwidth-bound, so they keep scaling with workers: with eight workers on PLAG066 the time was 0.43/0.32 ms per vector. Results agree with column-wise products up to about 5e-16 relative. The workspace is allocated on first use and kept by the plan; `multi_workspace_bytes(plan, k)` reports its size (20, 43 and 67 MB for `k = 9` on the three grains) and `release_multi_workspace!(plan)` frees it.
 
 ## Separate representation changes from new approximations
 

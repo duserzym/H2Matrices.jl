@@ -35,6 +35,7 @@ H2CompactMatvecPlan
 H2PacketMatvecPlan
 H2LowRankMatvecPlan
 multi_workspace_bytes
+release_multi_workspace!
 h2matvec!
 forward_transform!
 backward_transform!

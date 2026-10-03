@@ -20,7 +20,8 @@ Reference: Börm, "Efficient Numerical Methods for Non-local Operators",
 # ════════════════════════════════════════════════════════════════════
 
 """
-    compress_hmatrix_to_h2(hmat; rtol=1e-8, maxrank=50)
+    compress_hmatrix_to_h2(hmat; rtol=1e-8, maxrank=50, strict=false,
+                           threads=..., consume=false)
 
 Convert an assembled `HMatrix` (from HMatrices.jl) into an `H2Matrix`
 with shared nested cluster bases.
@@ -54,7 +55,10 @@ Ancestor interactions are condensed exactly: only Gram matrices of the active
 sets determine the bases, so each cluster passes a factor of width at most its
 size to its children instead of every ancestor block. A truncation that keeps
 every coefficient direction stores the identity (leaf `V = I` or an identity
-embedding), an exact change of coordinates that compact plans exploit.
+embedding), an exact change of coordinates that compact plans exploit. The
+operator equals the v0.1.3 construction (`_reference=true`) up to rounding;
+truncation ranks agree except for rounding-level decisions at the threshold
+(e.g. exactly rank-deficient active sets with `rtol=0`).
 
 # Returns
 An `H2Matrix` approximating the same kernel.

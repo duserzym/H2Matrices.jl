@@ -37,7 +37,8 @@ end
         ref = compress_hmatrix_to_h2(H; rtol=1e-10, maxrank=400, strict=true, _reference=true, _print=false)
         new = compress_hmatrix_to_h2(H; rtol=1e-10, maxrank=400, strict=true, threads=false, _print=false)
         thr = compress_hmatrix_to_h2(H; rtol=1e-10, maxrank=400, strict=true, threads=true, _print=false)
-        # Condensation leaves every truncation decision unchanged.
+        # Away from rounding-level ties at the threshold, condensation leaves
+        # every truncation decision unchanged.
         @test _node_ranks(new) == _node_ranks(ref)
         Mref = Matrix(ref); Mnew = Matrix(new)
         @test norm(Mnew - Mref) / norm(Mref) < 1e-13

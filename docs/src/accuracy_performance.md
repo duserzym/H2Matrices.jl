@@ -23,6 +23,7 @@ h2 = assemble_h2matrix_adaptive(K;
 | `nmax`, admissibility | Tree/block partitioning and resulting ranks/work | A mesh-independent best configuration |
 | `threads=true` | Builds the intermediate H-matrix leaves on all Julia threads; the result equals the serial build (`K` must allow concurrent `getblock!`) | Any accuracy change |
 | `comp` | Replaces the default `PartialACA(; rtol=aca_rtol)` H-block compressor | Accuracy of the substitute compressor |
+| `conversion_threads` | Runs the H → H² conversion as Julia tasks (default with several Julia threads and one BLAS thread); bitwise independent of the thread count | Any accuracy change |
 
 Kernel evaluation usually dominates the H-matrix build. A kernel type can
 specialize `HMatrices.getblock!` for `HMatrices.PermutedMatrix{<:MyKernel}`
@@ -64,7 +65,7 @@ mul!(Y, plan, X)
 mul!(X, adjoint(plan), Y)
 ```
 
-Multi-vector products use a workspace that is allocated on first use and kept by the plan. `H2Matrices.multi_workspace_bytes(plan, k)` reports its size; it grows with `k` up to the 16-vector block width.
+Multi-vector products use a workspace that is allocated on first use and kept by the plan. `multi_workspace_bytes(plan, k)` reports its size for `k` vectors and `multi_workspace_bytes(plan)` the size currently kept; it grows with `k` up to the 16-vector block width. `release_multi_workspace!(plan)` frees it (the next multi-vector product allocates one for its own width again).
 
 Use `adjoint(plan)` for the adjoint of this same stored approximation. Do not independently compress a transposed kernel and assume it is identical. A useful verification is `dot(z, plan*x) ≈ dot(adjoint(plan)*z, x)`, with a tolerance appropriate for accumulated rounding.
 
@@ -86,7 +87,7 @@ plan = build_operator(K)
 
 `assemble_h2matrix_adaptive` releases its private intermediate H-matrix block by block during the conversion, and `consume=true` releases the raw H² blocks while they are packed, so the H-matrix, raw H² operator and packets are never all alive together. Both are exact (the plan is bitwise identical). Construction still needs the H-matrix itself, basis/SVD workspaces and one packet at a time; reclamation is governed by Julia's garbage collector, which the consuming builders prompt with a few cheap full collections. Use `consume=true` only when the source operator is no longer needed.
 
-The conversion condenses ancestor interactions exactly (Gram-preserving QR of each cluster's active set), stores untruncated bases as identities, and runs independent subtrees and couplings as Julia tasks when Julia has several threads and BLAS uses one (`threads=true`; results are bitwise independent of the thread count).
+The conversion condenses ancestor interactions exactly (Gram-preserving QR of each cluster's active set), stores untruncated bases as identities, and runs independent subtrees and couplings as Julia tasks when Julia has several threads and BLAS uses one (`compress_hmatrix_to_h2(...; threads=true)`, `conversion_threads=true` in `assemble_h2matrix_adaptive`; results are bitwise independent of the thread count). Truncation ranks match the v0.1.3 construction except for rounding-level decisions at the threshold.
 
 `storage_bytes(plan)` counts numerical basis, transfer, coupling and near-field data, excluding scratch and metadata. `Base.summarysize(plan)` estimates retained Julia object size, including scratch/metadata; it is not process RSS and does not include unrelated FEM data or BLAS workspaces. Summing `summarysize` across copies can double-count shared matrices.
 

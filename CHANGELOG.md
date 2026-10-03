@@ -36,7 +36,8 @@
   independent of the worker count. Stored numeric data is unchanged.
 - Add `mul!(Y, plan, X)` and transpose/adjoint products with matrices for
   packet plans, streaming the operator once per block of up to 16 right-hand
-  sides, and `multi_workspace_bytes`.
+  sides, `multi_workspace_bytes` and `release_multi_workspace!` (frees or
+  shrinks the multi-RHS scratch kept by the plan).
 
 ## 0.1.3
 
