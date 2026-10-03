@@ -118,7 +118,7 @@ end
 
     @testset "Saturation certificate" begin
         rng = MersenneTwister(934)
-        L = Matrix(LowerTriangular(randn(rng, 40, 40))) + 10I
+        L = Matrix(UpperTriangular(randn(rng, 40, 40))) + 10I
         @test H2Matrices._certified_full_rank(L, 1e-10)
         L[end, end] = 1e-14
         @test !H2Matrices._certified_full_rank(L, 1e-10)
@@ -126,7 +126,7 @@ end
         @test !H2Matrices._certified_full_rank(L, 0.0)
         @test !H2Matrices._certified_full_rank(zeros(3, 3), 1e-10)
         # Certified matrices are indeed untruncated by the SVD rule.
-        G = Matrix(LowerTriangular(randn(rng, 30, 30))) + 6I
+        G = Matrix(UpperTriangular(randn(rng, 30, 30))) + 6I
         @test H2Matrices._certified_full_rank(G, 1e-10)
         @test H2Matrices._truncation_rank(svdvals(G), 1e-10, 30) == 30
     end

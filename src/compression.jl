@@ -316,7 +316,7 @@ function _build_adaptive_basis_recursive!(
     kinds = kinds === nothing ? _ConversionBases(cb) : kinds
     r = index_range(cb.cluster)
     seed = isempty(inherited) ? nothing :
-        reduce(hcat, [M[(first(r)-first(ar)+1):(last(r)-first(ar)+1), :] for (M, ar) in inherited])
+        Matrix(transpose(reduce(hcat, [M[(first(r)-first(ar)+1):(last(r)-first(ar)+1), :] for (M, ar) in inherited])))
     ctx = _BasisBuildContext(data, rtol, maxrank, is_row, capped_residuals, ReentrantLock(),
                              kinds, _condensed_spawn_min(threads))
     _condensed_basis!(cb, seed, ctx)

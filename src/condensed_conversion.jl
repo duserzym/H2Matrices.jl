@@ -72,12 +72,16 @@ _float_matrix(A) = Matrix{Float64}(A)
 _local_rows(child, parent_range) =
     (first(index_range(child.cluster)) - first(parent_range) + 1):(last(index_range(child.cluster)) - first(parent_range) + 1)
 
-# Active matrix C_t = [D_t, inherited] for this cluster, or `nothing` if empty.
+# The builder works with transposed active sets Cᵗ = C_t' (rows = columns of
+# C_t), so the condensing QR runs in place and children read their inherited
+# factor as a column block of the parent's R (= L_t') without copies.
+#
+# Cᵗ = [D_t'; inherited'] for this cluster, or `nothing` if empty.
 # AB' = (A R_B') Q_B': the isometric partner Q drops out, so the weighted
 # columns A R_B' measure block error independently of factor scaling. The
 # partner QR is the same blocked Householder factorization as `qr(partner)`,
 # computed in a per-cluster workspace; TRMM reads only its upper triangle.
-function _active_matrix(cb::ClusterBasis, ctx::_BasisBuildContext, inherited)
+function _active_matrix_t(cb::ClusterBasis, ctx::_BasisBuildContext, inherited_t)
     m = length(cb)
     entries = get(ctx.data, objectid(cb.cluster), nothing)
     wd = 0; maxn = 0; maxr = 0
@@ -88,10 +92,10 @@ function _active_matrix(cb::ClusterBasis, ctx::_BasisBuildContext, inherited)
             wd += min(n, r); maxn = max(maxn, n); maxr = max(maxr, r)
         end
     end
-    wi = inherited === nothing ? 0 : size(inherited, 2)
+    wi = inherited_t === nothing ? 0 : size(inherited_t, 1)
     w = wd + wi
     w == 0 && return nothing
-    C = Matrix{Float64}(undef, m, w)
+    Ct = Matrix{Float64}(undef, w, m)
     off = 0
     if wd > 0
         work = Matrix{Float64}(undef, maxn, maxr)
@@ -105,38 +109,44 @@ function _active_matrix(cb::ClusterBasis, ctx::_BasisBuildContext, inherited)
             A = view(work, 1:n, 1:r)
             copyto!(A, partner)
             LAPACK.geqrt!(A, view(tau, 1:min(36, q), 1:q))
-            dest = view(C, :, (off+1):(off+q))
+            dest = view(Ct, (off+1):(off+q), :)
             if q == r
-                copyto!(dest, factor)
-                BLAS.trmm!('R', 'U', 'T', 'N', 1.0, view(work, 1:r, 1:r), dest)
+                transpose!(dest, factor)
+                BLAS.trmm!('L', 'U', 'N', 'N', 1.0, view(work, 1:r, 1:r), dest)
             else
-                mul!(dest, factor, transpose(triu!(work[1:q, 1:r])))
+                mul!(dest, triu!(work[1:q, 1:r]), transpose(factor))
             end
             off += q
         end
     end
-    wi > 0 && copyto!(view(C, :, (off+1):w), inherited)
-    return C
+    wi > 0 && copyto!(view(Ct, (off+1):w, :), inherited_t)
+    return Ct
 end
 
-# Exact width condensation: returns (L, triangular) with L*L' == C*C' (up to
-# rounding); L is m × m lower triangular when C is wider than tall.
-function _condense_active(C::Matrix{Float64})
-    m, w = size(C)
-    w <= m && return C, false
-    F = qr!(Matrix(transpose(C)))
-    return Matrix(transpose(F.R)), true
+# Exact width condensation in place: returns (Lt, triangular) with
+# Lt'*Lt == Ct'*Ct (up to rounding). For Ct taller than wide, Lt is the m × m
+# upper-triangular R of Ct = Q*R (a view into Ct, lower part zeroed).
+function _condense_active_t!(Ct::Matrix{Float64})
+    w, m = size(Ct)
+    w <= m && return Ct, false
+    LAPACK.geqrt!(Ct, Matrix{Float64}(undef, min(36, m), m))
+    R = view(Ct, 1:m, 1:m)
+    for j in 1:m, i in (j+1):m
+        R[i, j] = 0.0
+    end
+    return R, true
 end
 
-function _leaf_basis!(cb::ClusterBasis, C, ctx::_BasisBuildContext)
+function _leaf_basis!(cb::ClusterBasis, Ct, ctx::_BasisBuildContext)
     m = length(cb)
     i = ctx.kinds.index[cb]
-    if C === nothing
+    if Ct === nothing
         cb.V = zeros(Float64, m, 0)
         cb.k = 0
         return cb
     end
-    F = svd!(C)
+    # Left singular vectors of C_t are the right singular vectors of Ct.
+    F = svd!(Ct)
     k = _truncation_rank(F.S, ctx.rtol, ctx.maxrank)
     _record_rank_cap!(ctx, F.S, k)
     if k == m
@@ -144,7 +154,7 @@ function _leaf_basis!(cb::ClusterBasis, C, ctx::_BasisBuildContext)
         ctx.kinds.kind[i] = _BASIS_IDENTITY
         ctx.kinds.full[i] = true
     else
-        cb.V = F.U[:, 1:k]
+        cb.V = Matrix(transpose(view(F.Vt, 1:k, :)))
     end
     cb.k = k
     return cb
@@ -192,22 +202,59 @@ function _project_basis(cb::ClusterBasis, M::Matrix{Float64}, kinds::_Conversion
     return _project_into!(Matrix{Float64}(undef, cb.k, size(M, 2)), cb, M, kinds)
 end
 
-# Rigorous sufficient test that a square lower-triangular L keeps every
-# direction under truncation: s_min >= 1/||L⁻¹||_F and s_max <= ||L||_F. The
+# out (n × cb.k) = M * (full basis of cb), M with |cb| columns; the
+# transposed counterpart of `_project_into!`.
+function _rproject_into!(out::AbstractMatrix{Float64}, cb::ClusterBasis, M::AbstractMatrix{Float64},
+                         kinds::_ConversionBases)
+    i = kinds.index[cb]
+    if kinds.full[i]
+        copyto!(out, M)
+    elseif isleaf(cb)
+        mul!(out, M, cb.V)
+    elseif kinds.kind[i] == _BASIS_IDENTITY
+        irange = index_range(cb.cluster)
+        off = 0
+        for child in cb.children
+            child.k == 0 && continue
+            _rproject_into!(view(out, :, (off+1):(off+child.k)), child,
+                            view(M, :, _local_rows(child, irange)), kinds)
+            off += child.k
+        end
+    else
+        fill!(out, 0.0)
+        cb.k == 0 && return out
+        irange = index_range(cb.cluster)
+        for child in cb.children
+            child.k == 0 && continue
+            Mc = view(M, :, _local_rows(child, irange))
+            if _full_identity(kinds, child)
+                mul!(out, Mc, child.E, 1.0, 1.0)
+            else
+                tmp = Matrix{Float64}(undef, size(M, 1), child.k)
+                _rproject_into!(tmp, child, Mc, kinds)
+                mul!(out, tmp, child.E, 1.0, 1.0)
+            end
+        end
+    end
+    return out
+end
+
+# Rigorous sufficient test that a square upper-triangular R keeps every
+# direction under truncation: s_min >= 1/||R⁻¹||_F and s_max <= ||R||_F. The
 # margin keeps the decision far from the threshold, so it agrees with the
 # SVD-based decision of the reference builder (exact up to rounding).
-function _certified_full_rank(L::Matrix{Float64}, rtol::Float64)
-    nf = norm(L)
+function _certified_full_rank(R::AbstractMatrix{Float64}, rtol::Float64)
+    nf = norm(R)
     (isfinite(nf) && nf > 0) || return false
-    Linv = try
-        inv(LowerTriangular(L))
+    Rinv = try
+        inv(UpperTriangular(R))
     catch err
         err isa SingularException && return false
         rethrow()
     end
-    ni = norm(Linv)
+    ni = norm(Rinv)
     isfinite(ni) || return false
-    return inv(ni * nf) > 16 * max(rtol, size(L, 1) * eps(Float64))
+    return inv(ni * nf) > 16 * max(rtol, size(R, 1) * eps(Float64))
 end
 
 function _mark_identity_embedding!(cb::ClusterBasis, kc::Int, kinds::_ConversionBases)
@@ -218,7 +265,7 @@ function _mark_identity_embedding!(cb::ClusterBasis, kc::Int, kinds::_Conversion
     return cb
 end
 
-function _transfer_basis!(cb::ClusterBasis, L, triangular::Bool, ctx::_BasisBuildContext)
+function _transfer_basis!(cb::ClusterBasis, Lt, triangular::Bool, ctx::_BasisBuildContext)
     kinds = ctx.kinds
     kc = sum(child.k for child in cb.children)
     if kc == 0
@@ -227,58 +274,59 @@ function _transfer_basis!(cb::ClusterBasis, L, triangular::Bool, ctx::_BasisBuil
             child.E = zeros(Float64, 0, 0)
         end
         return cb
-    elseif L === nothing
+    elseif Lt === nothing
         # No direct or ancestor far-field interaction: no parent basis needed.
         _set_empty_parent_basis!(cb)
         return cb
     end
-    # With identity children the projected matrix is L itself; a triangular L
-    # admits a cheap certificate that no truncation occurs (saturation).
-    if triangular && kc <= ctx.maxrank && size(L) == (kc, kc) &&
+    # With identity children the projected matrix is Lt itself; a triangular
+    # Lt admits a cheap certificate that no truncation occurs (saturation).
+    if triangular && kc <= ctx.maxrank && size(Lt) == (kc, kc) &&
        all(child -> _full_identity(kinds, child), cb.children) &&
-       _certified_full_rank(L, ctx.rtol)
+       _certified_full_rank(Lt, ctx.rtol)
         return _mark_identity_embedding!(cb, kc, kinds)
     end
     irange = index_range(cb.cluster)
-    P = Matrix{Float64}(undef, kc, size(L, 2))
+    Pt = Matrix{Float64}(undef, size(Lt, 1), kc)
     off = 0
     for child in cb.children
         child.k == 0 && continue
-        _project_into!(view(P, (off+1):(off+child.k), :), child, view(L, _local_rows(child, irange), :), kinds)
+        _rproject_into!(view(Pt, :, (off+1):(off+child.k)), child, view(Lt, :, _local_rows(child, irange)), kinds)
         off += child.k
     end
-    F = svd!(P)
+    # Left singular vectors of the projected active set = right ones of Pt.
+    F = svd!(Pt)
     k = _truncation_rank(F.S, ctx.rtol, ctx.maxrank)
     _record_rank_cap!(ctx, F.S, k)
     if k == 0
         _set_empty_parent_basis!(cb)
     elseif k == kc
-        # No truncation: the identity embedding spans the same space as F.U.
+        # No truncation: the identity embedding spans the same space.
         _mark_identity_embedding!(cb, kc, kinds)
     else
         cb.k = k
         off = 0
         for child in cb.children
-            child.E = F.U[(off+1):(off+child.k), 1:k]
+            child.E = Matrix(transpose(view(F.Vt, 1:k, (off+1):(off+child.k))))
             off += child.k
         end
     end
     return cb
 end
 
-function _condensed_basis!(cb::ClusterBasis, inherited, ctx::_BasisBuildContext)
-    C = _active_matrix(cb, ctx, inherited)
-    inherited = nothing
-    isleaf(cb) && return _leaf_basis!(cb, C, ctx)
-    L, triangular = C === nothing ? (nothing, false) : _condense_active(C)
-    C = nothing
+function _condensed_basis!(cb::ClusterBasis, inherited_t, ctx::_BasisBuildContext)
+    Ct = _active_matrix_t(cb, ctx, inherited_t)
+    inherited_t = nothing
+    isleaf(cb) && return _leaf_basis!(cb, Ct, ctx)
+    Lt, triangular = Ct === nothing ? (nothing, false) : _condense_active_t!(Ct)
     irange = index_range(cb.cluster)
-    # Rows of a lower-triangular L vanish beyond their own index: dropping these
-    # zero columns leaves every child's Gram matrix unchanged.
+    # Children inherit column blocks of Lt (views; Lt stays alive until they
+    # finish). Columns of an upper-triangular R vanish below their own index:
+    # dropping these zero rows leaves every child's Gram matrix unchanged.
     function sub(child)
-        L === nothing && return nothing
-        rows = _local_rows(child, irange)
-        return triangular ? L[rows, 1:last(rows)] : L[rows, :]
+        Lt === nothing && return nothing
+        cols = _local_rows(child, irange)
+        return triangular ? view(Lt, 1:last(cols), cols) : view(Lt, :, cols)
     end
     if length(cb) >= ctx.spawn_min && length(cb.children) > 1
         tasks = [Threads.@spawn(_condensed_basis!(child, sub(child), ctx)) for child in cb.children[2:end]]
@@ -289,7 +337,7 @@ function _condensed_basis!(cb::ClusterBasis, inherited, ctx::_BasisBuildContext)
             _condensed_basis!(child, sub(child), ctx)
         end
     end
-    return _transfer_basis!(cb, L, triangular, ctx)
+    return _transfer_basis!(cb, Lt, triangular, ctx)
 end
 
 _conversion_threads_default() = Threads.nthreads() > 1 && BLAS.get_num_threads() == 1
