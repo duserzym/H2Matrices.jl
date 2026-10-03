@@ -115,6 +115,10 @@ Float64 arithmetic, so the adjoint stays the exact transpose of the stored
 operator. Pass-through basis nodes copy coefficients in the upward and
 downward passes.
 
+The plan type is `H2PacketMatvecPlan{C}`, parametric in its coupling-packet
+type `C`; [`H2MixedPacketMatvecPlan`](@ref) runs its mixed-precision packets on
+the same engine.
+
 One plan is not safe for concurrent calls; `copy(plan)` shares numerical data
 and allocates independent scratch for an additional caller. Source data must
 remain unchanged while plans are used.

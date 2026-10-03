@@ -20,7 +20,6 @@ h2 = assemble_h2matrix_adaptive(K;
 | `maxrank` | Maximum retained basis rank | Accuracy if the required rank exceeds the cap |
 | `strict=true` | Reject a cap that violates a requested local threshold | Mesh, path or whole-campaign convergence |
 | `coupling_rtol` | Additional local coupling SVD truncation when requested | The original stored operator's accuracy without new checks |
-| `coupling_scale=:global` | Coupling truncation relative to the largest stored block norm instead of each block's own norm (requires `coupling_rtol`) | A global error bound |
 | `coupling_precision=Float32` or `Float16` | Float32/Float16 storage (range-scaled) of small retained coupling components, Float64 arithmetic (requires `coupling_rtol`) | Accuracy without new checks; the rounding error is estimated, not bounded |
 | `passthrough=true` | Exact folding of weakly compressing transfers into couplings (compact/packet plans) | Nothing beyond rounding without `coupling_rtol`; with it, the folded couplings are truncated differently |
 | `nmax`, admissibility | Tree/block partitioning and resulting ranks/work | A mesh-independent best configuration |
@@ -29,7 +28,8 @@ h2 = assemble_h2matrix_adaptive(K;
 | `conversion_threads` | Runs the H → H² conversion as Julia tasks (default with several Julia threads and one BLAS thread); bitwise independent of the thread count | Any accuracy change |
 | `error_control=:global` | Measures ACA and basis truncations against one operator scale `s` (absolute tolerances `aca_rtol*s` and `rtol*s`) instead of each block's or cluster's own norm | That weak blocks need less relative accuracy in a given application |
 | `atol`, `aca_atol`, `safeguard_rtol` | Explicit absolute basis and ACA thresholds, and a relative floor for the basis threshold | A global error bound |
-| `coupling_scale` | Reference of the optional coupling truncation: the coupling's own norm (`:block`), the largest stored block norm (`:global`) or a given scale | The original stored operator's accuracy without new checks |
+| `coupling_scale` | Reference of the optional coupling truncation (requires `coupling_rtol`): the coupling's own norm (`:block`), the largest stored block norm (`:global`) or a given scale `s` (threshold `coupling_rtol*s`) | A global error bound; the original stored operator's accuracy without new checks |
+| `precision_rtol`, `format48` | Float32 (and 48-bit) storage of low-weight rotated packet rows in `H2MixedPacketMatvecPlan`, under the a priori bound `‖Ã - A‖_F ≤ precision_rtol · ‖A‖_F` relative to the Float64 compact operator | A per-vector or physical error bound; the compact operator's own accuracy |
 
 Kernel evaluation usually dominates the H-matrix build. A kernel type can
 specialize `HMatrices.getblock!` for `HMatrices.PermutedMatrix{<:MyKernel}`
@@ -215,25 +215,43 @@ block-relative control needed the same storage (PLAG036: 703.7 MB at 1.8e-11).
 
 ```julia
 BLAS.set_num_threads(1)
-plan = H2MixedPacketMatvecPlan(h2; workers=4, precision_rtol=1e-13, consume=true)
+plan = H2MixedPacketMatvecPlan(h2; workers=4, precision_rtol=1e-13, passthrough=true, consume=true)
 precision_summary(plan)        # bound, reference norm, Float32 rows, byte counts
 ```
 
 Each coupling packet is rotated to its left singular basis; rows of small singular weight are stored in Float32 (with `format48=true` also in a 48-bit format) and every product accumulates in Float64. The rows are chosen to minimize bytes under the a priori bound `‖Ã - A‖_F ≤ precision_rtol · η` on the reduced-precision rounding, where `η` is the Frobenius norm of the stored blocks (`‖A‖_F` for orthonormal bases). It is a root-mean-square bound on product perturbations, not a per-vector guarantee, and it does not include the Float64 roundoff of the rotations themselves. The near field stays in Float64.
 
-The plan runs on the packet-plan engine with the same kernels: forward and adjoint products apply the same stored values (the adjoint is an exact transpose), products are bitwise independent of the worker count, several right-hand sides are supported, and `precision_rtol=0` reproduces `H2PacketMatvecPlan` bitwise. Construction is deterministic under threads. It costs about one to three extra seconds on the meshes below (eigen-decompositions of packet Gram matrices) and does not raise the build's peak memory, which the H → H² conversion sets.
+The plan runs on the packet-plan engine with the same kernels: forward and adjoint products apply the same stored values (the adjoint is an exact transpose), products are bitwise independent of the worker count, several right-hand sides are supported, and `precision_rtol=0` reproduces `H2PacketMatvecPlan` bitwise. Construction is deterministic under threads. From an H² matrix the plan accepts the compact options `passthrough`, `coupling_rtol` and `coupling_scale` (with `consume=true` the source blocks are released while the plan is built). Pass-through composes exactly and is recommended. Factorized couplings from `coupling_rtol` are multiplied out in the packets, so they bring no storage saving here; `coupling_precision` is a different reduced-precision storage and is rejected.
 
-Measured on the PLAG066/PLAG036 boundary operators (nb 6028/12415; `nmax=32`, `eta=3`, `aca_rtol=1e-11`, `rtol=1e-10`, `maxrank=512/2048`, strict):
+Measured on the PLAG066/PLAG036 boundary operators (nb 6028/12415; `nmax=32`, `aca_rtol=1e-11`, `rtol=1e-10`, strict ranks; largest relative forward/adjoint errors against exact dense products):
 
-| `precision_rtol` | Operator MB (PLAG066 / PLAG036) | Relative error vs dense, forward (PLAG066 / PLAG036) |
+| Configuration | Operator MB (PLAG066 / PLAG036) | Error, PLAG066 | Error, PLAG036 |
+|---|---|---|---|
+| packet plan, `eta=3` (Float64) | 302.8 / 714.8 | 1.850e-11 / 1.717e-11 | 7.705e-11 / 7.601e-11 |
+| `1e-13` | 256.8 / 637.2 | 1.850e-11 / 1.717e-11 | 7.705e-11 / 7.601e-11 |
+| `1e-13`, `format48=true` | 225.2 / 578.1 | 1.850e-11 / 1.717e-11 | 7.705e-11 / 7.601e-11 |
+| `1e-13`, `passthrough=true` | 241.7 / 582.1 | 1.850e-11 / 1.717e-11 | 7.705e-11 / 7.601e-11 |
+| `1e-13`, `format48=true`, `passthrough=true` | 209.8 / 521.3 | 1.850e-11 / 1.717e-11 | 7.705e-11 / 7.601e-11 |
+| `eta=1.5`, `1e-13`, `passthrough=true` | 245.9 / 578.5 | 1.155e-11 / 9.68e-12 | 5.902e-11 / 6.008e-11 |
+| `eta=1.5`, `1e-13`, `format48=true`, `passthrough=true` | 211.4 / 517.2 | 1.155e-11 / 9.68e-12 | 5.902e-11 / 6.008e-11 |
+
+The difference from the Float64 operator is about `4e-14` relative, three orders of magnitude below the compression error, so errors against the dense operator change by at most `5e-5` of their value (in either direction; with `eta=3` this can exceed the validated errors in the last digits). With `eta=1.5` the underlying operator is more accurate than the validated one, and the bounded rounding keeps it so.
+
+Single-vector products read fewer bytes and are memory-bound, so they get faster: with four workers and pass-through, 1.35/1.27 ms forward/adjoint against 1.64/1.44 ms for the validated packet plan on PLAG066 and 3.96/3.54 against 4.46/4.06 ms on PLAG036. With several right-hand sides the kernels are compute-bound; the mixed plan does the same number of multiply-adds plus the widening, so per-vector times with nine vectors were up to 16% slower than the packet plan's. `format48=true` saves another 10-14% of operator bytes, with single-vector products from 3% slower to 11% faster than the packet plan's and 27-54% slower multi-vector products. Looser `precision_rtol` saves more bytes (`1e-12`: about 7% more without pass-through) but starts to change the operator at the compression-error level; validate it before use. [Compare the variants](advances.md#Compare-the-variants) lists all timings.
+
+## Choose a configuration
+
+All of the following use one BLAS thread, `nmax=32`, `aca_rtol=1e-11`, `strict=true` and a rank cap that is not reached, and meet the validated product-error levels on PLAG066 and PLAG036 (see the tables above and in [How the advances work](advances.md#Compare-the-variants)). Only the first two leave the validated approximation unchanged; the others need the application's own validation.
+
+| Goal | Settings | PLAG066 / PLAG036 MB |
 |---|---|---|
-| packet plan (Float64) | 302.8 / 714.8 | 1.8496e-11 / 7.7053e-11 |
-| `1e-13` | 256.8 / 637.2 | 1.8496e-11 / 7.7054e-11 |
-| `1e-13`, `format48=true` | 225.2 / 578.1 | 1.8496e-11 / 7.7054e-11 |
+| Validated operator, exact representation changes only | `assemble_h2matrix_adaptive(K; rtol=1e-10, ...)`, then `H2PacketMatvecPlan(h2; workers=4, consume=true, passthrough=true)` | 288.1 / 661.0 |
+| Smallest Float64 operator | `eta=1.5` (`adm=StrongAdmissibilityStd(1.5)`), `rtol=1e-10`; plan options `passthrough=true, coupling_rtol=2e-11, coupling_scale=:global` | 258.5 / 628.5 |
+| Smallest operator overall | `eta=1.5`, `rtol=5e-11`; plan options `passthrough=true, coupling_rtol=1e-11, coupling_scale=:global, coupling_precision=Float16` | 179.1 / 474.9 |
+| Reduced precision with a rigorous bound | `eta=1.5`, `rtol=1e-10`; `H2MixedPacketMatvecPlan(h2; workers=4, precision_rtol=1e-13, format48=true, passthrough=true, consume=true)` | 211.4 / 517.2 |
+| Fastest single products | as above without `format48` | 245.9 / 578.5 |
 
-The difference from the Float64 operator is about `4e-14` relative, three orders of magnitude below the compression error, so errors against the dense operator change by at most `5e-5` of their value (in either direction).
-
-Single-vector products read fewer bytes and are memory-bound, so they get faster: same-process medians with four workers (BLAS threads=1, 14-core Apple M4 Pro, shared machine) were 1.87/1.68 ms forward/adjoint against 2.02/1.74 ms for the packet plan on PLAG066 and 4.44/4.28 against 4.76/4.42 ms on PLAG036 (six workers: 1.56/1.52 against 1.83/1.70 and 3.78/3.78 against 4.04/4.18 ms). With several right-hand sides the kernels are compute-bound; the mixed plan does the same number of multiply-adds plus the widening, so per-vector times with nine vectors were 1–17% slower than the packet plan's. `format48=true` saves another 9–12% of operator bytes at similar single-vector speed and 20–35% slower multi-vector products. Looser `precision_rtol` saves more bytes (`1e-12`: about 6% more) but starts to change the operator at the compression-error level; validate it before use.
+In Merrill's end-to-end check on PLAG066 at 20 °C (six magnetization states against the dense operator), the largest tangent-torque differences were 6.95e-10 T for the validated settings and 4.1e-10, 2.5e-10 and 4.2e-10 T for the smallest Float64, smallest overall and rigorous-bound settings, and the largest energy differences 8.3e-8, 4.5e-8, 1.4e-7 and 4.5e-8 kT. These are single-grain checks, not a substitute for the validation steps below.
 
 ## Validate before enlarging a campaign
 

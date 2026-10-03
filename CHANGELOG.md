@@ -34,55 +34,70 @@
   order. The upward pass, forward near field and downward pass now run in
   parallel, per-worker reduction buffers are removed, and products are bitwise
   independent of the worker count. Stored numeric data is unchanged.
-- Global (absolute) error control, opt-in: `compress_hmatrix_to_h2(...; atol,
-  safeguard_rtol)` keeps basis singular values above
-  `max(rtol*σ₁, min(atol, safeguard_rtol*σ₁))`;
-  `assemble_h2matrix_adaptive(...; error_control=:global, scale)` uses the
-  absolute ACA tolerance `aca_rtol*s` and basis threshold `rtol*s` with the
-  new `estimate_operator_scale` (RMS row norm from sampled kernel rows), and
-  also accepts explicit `atol`/`aca_atol`; `H2CompactMatvecPlan(...;
-  coupling_scale=:block|:global|s)` truncates couplings against their own
-  norm, the largest stored block norm or a given scale (`coupling_scale`
-  without `coupling_rtol` is rejected). Defaults are unchanged. On the
-  campaign's boundary operator global control saved only about 1% over
-  block-relative control at equal accuracy.
-- Packet plans keep factorized compact-plan couplings as factors
-  (`keep_factors=true`), in single- and multi-vector products, and drop
-  zero-rank couplings; compact plans release each exact coupling as it is
-  factorized.
-- Add `mul!(Y, plan, X)` and transpose/adjoint products with matrices for
-  packet plans, streaming the operator once per block of up to 16 right-hand
-  sides, `multi_workspace_bytes` and `release_multi_workspace!` (frees or
-  shrinks the multi-RHS scratch kept by the plan).
+- One packet engine for several packet layouts: `H2PacketMatvecPlan{C}` is
+  parametric in its coupling-packet type, and the structured packets below and
+  the mixed-precision packets of `H2MixedPacketMatvecPlan` share its phases,
+  write ownership, near-field column packets, slot reductions and kernels
+  (`TransposedPacketH2Plan` now uses `<:H2PacketMatvecPlan`).
 - `H2CompactMatvecPlan(h2; passthrough=true)`: internal basis nodes whose
   transfer matrices barely compress and serve few couplings use their
   children's concatenated coefficients; their transfers are folded into
   couplings and parent transfers (exact up to rounding; less storage and
   faster products). Packet plans copy those coefficients in the upward and
   downward passes.
-- Compact-plan coupling truncation gains `coupling_scale=:global` (threshold
-  relative to the largest stored block norm) and `coupling_precision=Float32`
-  or `Float16` (small retained components stored in reduced precision with
-  exact power-of-two column scales where needed, Float64 arithmetic, so the
-  adjoint stays the exact transpose of the stored operator). Both qualify
-  `coupling_rtol` and are rejected without it. These are approximations.
-- Packet plans keep factorized couplings as factors (`keep_factors=true`)
-  and store mixed-precision couplings in per-precision packet parts.
-  `H2PacketMatvecPlan(h2; consume=true, compact options...)` and
+- Compact-plan coupling truncation (`coupling_rtol`) gains `coupling_scale`:
+  `:block` (default, each coupling's own norm), `:global` (the largest stored
+  block norm, near field included) or a positive number `s` (threshold
+  `coupling_rtol*s`), and `coupling_precision=Float32` or `Float16` (small
+  retained components stored in reduced precision with exact power-of-two
+  column scales where needed, Float64 arithmetic, so the adjoint stays the
+  exact transpose of the stored operator). Both qualify `coupling_rtol` and
+  are rejected without it. These are approximations.
+- Packet plans keep factorized couplings as factors (`keep_factors=true`;
+  `false` multiplies them out), store reduced-precision couplings in
+  per-precision packet parts, and drop couplings without any retained
+  component. `H2PacketMatvecPlan(h2; consume=true, compact options...)` and
   `H2CompactMatvecPlan(h2; consume=true)` release the source blocks while the
-  plan is built; the plans are identical to non-consuming builds.
+  plan is built (each transformed coupling once factorized); the plans are
+  identical to non-consuming builds.
 - Add `H2MixedPacketMatvecPlan(compact_or_h2; workers, precision_rtol=1e-13,
   format48=false)` and `precision_summary`: coupling packets rotated to their
   left singular basis store low-weight rows in Float32 (optionally a 48-bit
   format) under an a priori Frobenius bound `precision_rtol * η` on the
   reduced-precision rounding; products accumulate in Float64 and the adjoint
-  is the exact transpose of the stored operator. The plan runs on the
-  `H2PacketMatvecPlan` task engine (near field in Float64 column packets),
-  so products are bitwise independent of the worker count and support
-  several right-hand sides; construction is bitwise deterministic under
-  threads; `consume=true` releases the source H² blocks; packets whose norm
-  could overflow a reduced format stay in Float64. `H2PacketMatvecPlan` is
-  now parametric in its coupling-packet type (`H2PacketMatvecPlan{C}`).
+  is the exact transpose of the stored operator. It runs on the packet engine
+  (near field in Float64 column packets), so products are bitwise independent
+  of the worker count and support several right-hand sides; construction is
+  bitwise deterministic under threads; packets whose norm could overflow a
+  reduced format stay in Float64. It composes with pass-through bases: the
+  rotations of pass-through nodes and of their children, which share
+  coefficients with their parent, are stored as reflectors instead of being
+  absorbed into the basis. From an H² matrix it forwards compact options
+  (`passthrough`, `coupling_rtol`, `coupling_scale`) to a consuming compact
+  plan with `consume=true`; factorized couplings are multiplied out, and
+  `coupling_precision` (a different reduced-precision storage) is rejected
+  before anything is consumed.
+- Global (absolute) error control, opt-in: `compress_hmatrix_to_h2(...; atol,
+  safeguard_rtol)` keeps basis singular values above
+  `max(rtol*σ₁, min(atol, safeguard_rtol*σ₁))`;
+  `assemble_h2matrix_adaptive(...; error_control=:global, scale)` uses the
+  absolute ACA tolerance `aca_rtol*s` and basis threshold `rtol*s` with the
+  new `estimate_operator_scale` (RMS row norm from sampled kernel rows), and
+  also accepts explicit `atol`/`aca_atol`. Defaults are unchanged. On the
+  campaign's boundary operator global control saved only about 1% over
+  block-relative control at equal accuracy.
+- Add `mul!(Y, plan, X)` and transpose/adjoint products with matrices for
+  packet plans, streaming the operator once per block of up to 16 right-hand
+  sides, `multi_workspace_bytes` and `release_multi_workspace!` (frees or
+  shrinks the multi-RHS scratch kept by the plan).
+- Measured on the campaign's PLAG066/PLAG036 boundary operators (6,028/12,415
+  nodes; dense 290.7/1233 MB): the validated `eta=3` operator is 302.8/714.8
+  MB; exact pass-through 288.1/661.0 MB; with `eta=1.5` and Float64 global
+  coupling truncation 258.5/628.5 MB; with Float16 coupling tiers
+  179.1/474.9 MB; mixed-precision packets on pass-through `eta=1.5` bases
+  211.4/517.2 MB (`format48=true`) under the 1e-13 bound. All of these meet
+  the validated product-error levels against exact dense products; see
+  `docs/src/advances.md` for timings and the trade-offs.
 
 ## 0.1.3
 

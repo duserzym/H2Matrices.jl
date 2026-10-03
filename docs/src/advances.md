@@ -212,18 +212,59 @@ These are approximations and require the same physical validation as any relaxed
 | PLAG022 | `eta=1.5`, `rtol=5e-11`, `passthrough`, global `coupling_rtol=1.5e-11`, Float32 | 916.00 MB | 2.81e-11 / 2.57e-11 |
 | PLAG022 | `eta=1.5`, `rtol=5e-11`, `passthrough`, global `coupling_rtol=1e-11`, Float16 | 853.52 MB | 2.76e-11 / 2.40e-11 |
 
-Storage and errors were reproduced on the current packet engine to the reported digits for PLAG066 and PLAG036 (PLAG022 was measured with the earlier engine). Forward/adjoint products with four workers, interleaved medians in one process on a shared machine (milliseconds; PLAG066 / PLAG036):
-
-| Configuration | One worker | Four workers | Eight workers (PLAG066) | Per vector, 9 right-hand sides, four workers |
-|---|---|---|---|---|
-| core packet plan, `eta=3` | 5.80/5.19 / 14.18/12.97 | 2.00/1.80 / 4.81/4.29 | 1.88/1.76 | 0.62/0.55 / 1.35/1.24 |
-| Float64 global truncation (258.55 / 628.53 MB) | 5.40/5.10 / 12.82/12.23 | 1.84/1.69 / 4.20/3.96 | 1.61/1.55 | 0.59/0.52 / 1.24/1.18 |
-| Float32 (190.24 / 497.86 MB) | 6.07/6.16 / 14.25/14.73 | 1.84/1.84 / 4.25/4.28 | 1.49/1.49 | 0.72/0.66 / 1.53/1.47 |
-| Float16 (179.14 / 474.95 MB) | 7.59/7.35 / 17.18/17.28 | 2.17/2.06 / 4.94/4.98 | 1.65/1.68 | 0.79/0.73 / 1.70/1.65 |
-
-Reduced-precision parts store fewer bytes per number but convert every number to Float64 before multiplying it, and factored segments add short inner products. They are therefore compute bound rather than bandwidth bound: with four workers the Float32 variant runs about as fast as the core plan (12% faster to 2% slower) and the Float16 variant 3-16% slower; with one worker they are up to 19% and 42% slower. They gain with more workers (eight workers: 21% and 12% faster forward products than the core plan on PLAG066). Products with several right-hand sides, which are compute bound anyway, take 13-33% longer per vector. Building the compact plan adds threaded SVDs of all couplings (1.0-1.1 s on PLAG066, 2.2-2.3 s on PLAG036; a Frobenius-norm bound skips most spectral norms of the global scale, giving the same value); because `eta=1.5` makes ACA and the conversion cheaper, H-matrix assembly, conversion and plan took 3.7 s against 2.9 s for the core build on PLAG066 and 12.2 s against 13.0 s on PLAG036. The build-time memory peak remains the conversion (H-matrix plus H² matrix); with `consume=true` the plan stage stays below it. Dense storage is 290.69, 1233.0 and 2556.1 MB for the three grains.
+Storage and errors were reproduced on the current packet engine to the reported digits for PLAG066 and PLAG036 (PLAG022 was measured with the earlier engine); [Compare the variants](#Compare-the-variants) below gives same-process timings. Reduced-precision parts store fewer bytes per number but convert every number to Float64 before multiplying it, and factored segments add short inner products, so they are compute bound rather than bandwidth bound: with four workers the Float32 variant ran about as fast as the validated packet plan (9% faster to 5% slower) and the Float16 variant 7-26% slower, with one worker up to 17% and 38% slower, and products with several right-hand sides took 11-36% longer per vector. In an earlier run on a shared machine they gained with more workers (eight workers: 21% and 12% faster forward products than the validated packet plan on PLAG066). Building the compact plan adds threaded SVDs of all couplings (about 1 s on PLAG066, 2 s on PLAG036; a Frobenius-norm bound skips most spectral norms of the global scale, giving the same value); because `eta=1.5` makes ACA and the conversion cheaper, H-matrix assembly, conversion and plan took 3.7 s against 2.9 s for the validated build on PLAG066 and 12.2 s against 13.0 s on PLAG036. The build-time memory peak remains the conversion (H-matrix plus H² matrix); with `consume=true` the plan stage stays below it. Dense storage is 290.69, 1233.0 and 2556.1 MB for the three grains.
 
 The dense PLAG066 matrix needs 290.69 MB, so only the mixed-precision variants compress it substantially at this accuracy. The physics of the kernel limits compression: at relative accuracy near `1e-11` the far field of clusters below roughly 200 points remains full rank even for `eta=0.5`, so much of the operator is stored as dense or physical-coordinate blocks whatever the admissibility.
+
+## Store low-weight packet rows in reduced precision under a bound
+
+`H2MixedPacketMatvecPlan` reduces precision without changing the compact operator's ranks, under an a priori bound. Each coupling packet `P` (all couplings of one row node, `k × N`) is rotated to its left singular basis, `P = Q W`, so row `i` of `W` has norm `ω_i = σ_i(P)`. Rounding row `i` to Float32 perturbs the operator by at most `u₃₂ ω_i` in the Frobenius norm (`u₃₂ = 2⁻²⁴`; an optional 48-bit format has `u₄₈ = 2⁻³⁷`), so a global Lagrangian selection stores the low-weight rows in reduced precision and minimizes bytes subject to
+
+```math
+\|\widetilde A - A\|_F \le \Big(\sum_t \beta_t^2 \big[\textstyle\sum_{i\in f_{32}(t)} u_{32}^2\omega_i^2 + \sum_{i\in f_{48}(t)} u_{48}^2\omega_i^2\big]\Big)^{1/2} \le \texttt{precision\_rtol}\cdot\eta ,
+```
+
+with `β_t` the product of the row and column basis norms and `η` the Frobenius norm of the stored blocks (`‖A‖_F` for orthonormal bases). The bound covers the reduced-precision rounding only; the Float64 rotations add roundoff of order `ε κ ‖P‖` (about `1e-16` relative for orthonormal bases). Products accumulate in Float64, so the adjoint is the exact transpose of the stored mixed operator.
+
+The rotation is absorbed into an explicit row basis (`E ← Uᵀ E`, `V ← V U`, children's `E ← E U`) at no storage cost. Where the coefficients are not reached through a transfer matrix, it is stored as Householder reflectors instead, and their bytes enter the selection: for saturated (identity) rows, for pass-through nodes and for the children of pass-through nodes, whose coefficients are copied into and out of the parent's concatenated coefficients. (Absorbing the rotation of such a child would rotate a slice of its parent's coefficients without rotating the parent's packet; on a test problem that gave products 1e7-1e10 times the bound, which the combined tests now exclude.) The near field stays in Float64.
+
+The mixed packets are a second packet type of the same engine: `H2PacketMatvecPlan{C}` runs either packet type with the same phases, write ownership, slot reductions, near-field column packets and fused kernels, which widen Float32 and 48-bit entries on load. Products are therefore bitwise independent of the worker count, several right-hand sides work, `precision_rtol=0` reproduces the packet plan bitwise, and construction is bitwise deterministic under threads. Building the plan costs eigen-decompositions of the packet Gram matrices (0.5-1 s on PLAG066, 2.7-4.5 s on PLAG036).
+
+`coupling_precision` (above) and this plan are alternatives: the former rounds small singular components of each coupling after truncating it against an operator scale and has only an error estimate; the latter rounds whole rotated packet rows of an untruncated operator under a rigorous bound. Factorized couplings are multiplied out in mixed packets, so combining them with `coupling_rtol` gives up the truncation's storage saving, and a compact plan with reduced-precision couplings is rejected.
+
+## Compare the variants
+
+Same-process measurements on the PLAG066 and PLAG036 boundary operators, all from the same H² matrices (ACA `1e-11`, `nmax=32`, strict ranks, consuming threaded conversion) and packet engine. Errors are the largest relative errors of forward/adjoint products against exact dense products over four reference vectors; the validated `eta=3` operator gives 1.850e-11/1.717e-11 (PLAG066) and 7.705e-11/7.601e-11 (PLAG036). Product times are medians of 15-21 interleaved rounds with one BLAS thread on a 14-core M4 Pro (load average 2-4); the plan time excludes compilation and building from the H² matrix.
+
+| Variant | Exact? | PLAG066 MB | PLAG066 error | PLAG036 MB | PLAG036 error |
+|---|---|---:|---|---:|---|
+| packet plan, `eta=3`, `rtol=1e-10` (validated) | reference | 302.8 | 1.85e-11 / 1.72e-11 | 714.8 | 7.71e-11 / 7.60e-11 |
+| + `passthrough` | yes (rounding) | 288.1 | 1.85e-11 / 1.72e-11 | 661.0 | 7.71e-11 / 7.60e-11 |
+| mixed `1e-13`, `passthrough` | bounded rounding | 241.7 | 1.85e-11 / 1.72e-11 | 582.1 | 7.71e-11 / 7.60e-11 |
+| mixed `1e-13`, `format48`, `passthrough` | bounded rounding | 209.8 | 1.85e-11 / 1.72e-11 | 521.3 | 7.71e-11 / 7.60e-11 |
+| `eta=1.5`, `passthrough` | new tree | 286.5 | 1.16e-11 / 9.68e-12 | 665.8 | 5.90e-11 / 6.01e-11 |
+| `eta=1.5`, `passthrough`, mixed `1e-13` | new tree, bounded rounding | 245.9 | 1.16e-11 / 9.68e-12 | 578.5 | 5.90e-11 / 6.01e-11 |
+| `eta=1.5`, `passthrough`, mixed `1e-13`, `format48` | new tree, bounded rounding | 211.4 | 1.16e-11 / 9.68e-12 | 517.2 | 5.90e-11 / 6.01e-11 |
+| `eta=1.5`, `passthrough`, global `coupling_rtol=2e-11` | truncated | 258.5 | 1.62e-11 / 1.65e-11 | 628.5 | 6.09e-11 / 6.16e-11 |
+| `eta=1.5`, `rtol=5e-11`, `passthrough`, global `1.5e-11`, Float32 | truncated, rounded | 190.2 | 1.37e-11 / 1.38e-11 | 497.9 | 3.35e-11 / 3.27e-11 |
+| `eta=1.5`, `rtol=5e-11`, `passthrough`, global `1e-11`, Float16 | truncated, rounded | 179.1 | 1.22e-11 / 1.26e-11 | 474.9 | 3.32e-11 / 3.23e-11 |
+
+With seven digits, the `eta=3` mixed variants move the errors by at most 4.6e-5 of their value, in either direction (PLAG066 forward 1.8496135e-11 for the packet plan, 1.8496130e-11 and 1.8496696e-11 for the two pass-through mixed variants): the stored-operator perturbation, about `4.2e-14` relative, is three orders of magnitude below the compression error. Forward/adjoint product times in milliseconds:
+
+| Variant | PLAG066, 1 worker | PLAG066, 4 workers | PLAG066, 9 vectors, per vector | PLAG036, 1 worker | PLAG036, 4 workers | PLAG036, 9 vectors, per vector | Plan s (066/036) |
+|---|---|---|---|---|---|---|---|
+| validated packet plan | 5.20 / 4.67 | 1.64 / 1.44 | 0.59 / 0.50 | 13.80 / 12.39 | 4.46 / 4.06 | 1.32 / 1.20 | 0.03 / 0.04 |
+| + `passthrough` | 5.14 / 4.42 | 1.61 / 1.37 | 0.58 / 0.48 | 13.54 / 11.80 | 4.37 / 3.72 | 1.25 / 1.12 | 0.26 / 0.57 |
+| mixed, `passthrough` | 4.55 / 4.38 | 1.35 / 1.27 | 0.58 / 0.58 | 12.40 / 11.96 | 3.96 / 3.54 | 1.43 / 1.34 | 0.96 / 4.48 |
+| mixed, `format48`, `passthrough` | 5.55 / 5.34 | 1.51 / 1.44 | 0.75 / 0.75 | 14.36 / 13.76 | 4.21 / 3.82 | 1.71 / 1.66 | 0.95 / 4.48 |
+| `eta=1.5`, `passthrough` | 4.93 / 4.50 | 1.57 / 1.37 | 0.60 / 0.49 | 12.70 / 11.59 | 4.07 / 3.73 | 1.23 / 1.14 | 0.20 / 0.46 |
+| `eta=1.5`, mixed, `passthrough` | 4.68 / 4.48 | 1.41 / 1.30 | 0.58 / 0.58 | 12.03 / 11.79 | 3.72 / 3.53 | 1.41 / 1.37 | 0.55 / 2.73 |
+| `eta=1.5`, mixed, `format48`, `passthrough` | 5.73 / 5.48 | 1.57 / 1.49 | 0.76 / 0.77 | 14.02 / 13.71 | 3.96 / 3.83 | 1.73 / 1.69 | 0.57 / 2.72 |
+| Float64 global truncation | 4.76 / 4.51 | 1.49 / 1.36 | 0.55 / 0.48 | 12.46 / 11.97 | 3.95 / 3.75 | 1.22 / 1.13 | 0.92 / 2.01 |
+| Float32 coupling tier | 5.41 / 5.36 | 1.59 / 1.51 | 0.67 / 0.61 | 13.99 / 14.46 | 4.06 / 4.11 | 1.47 / 1.40 | 0.97 / 2.09 |
+| Float16 coupling tier | 6.58 / 6.46 | 1.93 / 1.82 | 0.74 / 0.68 | 16.75 / 17.06 | 4.77 / 4.78 | 1.62 / 1.56 | 0.96 / 2.07 |
+
+So the variants trade memory against speed differently. Float32 packet rows under the bound make single products 10-18% faster than the validated plan with four workers (memory bound) and multi-vector products up to 16% slower per vector (compute bound); the 48-bit format saves another 10-14% of the bytes but decodes slowly. The Float16 coupling tier stores the fewest bytes but is the slowest variant with one or four workers. The mixed plan's construction is the slowest (the PLAG036 Gram eigen-decompositions take 2.7-4.5 s), but it remains below the conversion's cost.
 
 ## Implementation and background
 
