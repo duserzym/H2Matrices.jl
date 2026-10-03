@@ -10,7 +10,8 @@
 #   adjoint  near:     owned column interval       += Q' * gathered row segments
 # Slots are reduced in a fixed order by the downward-pass task that owns the
 # destination entries. A product therefore runs three phases of independent
-# tasks (upward pass, interactions, reduction plus downward pass), no two
+# tasks (upward pass with near-field packets, coupling packets, reduction plus
+# downward pass), no two
 # tasks of a phase write the same entries, and every task has a fixed
 # evaluation order: products are deterministic and bitwise independent of the
 # worker count and of the dynamic task assignment.
@@ -66,12 +67,13 @@ column packets. Packing does not truncate data. Combined with implicit
 saturated bases, it preserves the source operator up to floating-point
 rounding. Numeric blocks are retained without the source operator.
 
-Products run three phases of independent tasks (upward pass, interactions,
-slot reduction plus downward pass) with explicit ownership of every written
-entry, so no private reduction buffers are needed. `workers>1` applies tasks
-with dynamic, cost-ordered scheduling; every task has a fixed evaluation
-order, so products are deterministic and bitwise independent of the worker
-count. Use BLAS threads=1 when enabling packet workers.
+Products run three phases of independent tasks (upward pass together with
+near-field packets, coupling packets, slot reduction plus downward pass) with
+explicit ownership of every written entry, so no private reduction buffers are
+needed. `workers>1` applies tasks with dynamic, cost-ordered scheduling;
+every task has a fixed evaluation order, so products are deterministic and
+bitwise independent of the worker count. Use BLAS threads=1 when enabling
+packet workers.
 
 `mul!(Y, plan, X)` and `mul!(Y, adjoint(plan), X)` with matrices apply several
 right-hand sides while streaming the stored operator once.
@@ -87,6 +89,7 @@ struct H2PacketMatvecPlan <: AbstractMatrix{Float64}
     packets::Vector{_CouplingPacket}
     nearpackets::Vector{_NearPacket}
     tasks::Vector{Int}
+    neartasks::Vector{Int}
     rowup::_TreeSchedule
     colup::_TreeSchedule
     rowdown::_TreeSchedule
@@ -216,10 +219,11 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1)
         end
     end
     none=[_SlotRef[] for _ in rspans];cnone=[_SlotRef[] for _ in cspans]
-    tasks=vcat(collect(eachindex(packets)),.-collect(eachindex(nearpackets)))
-    sort!(tasks;by=k->k>0 ? length(packets[k].matrix) : length(nearpackets[-k].matrix),rev=true)
+    # Near-field packets need no upward pass; they share the first phase with it.
+    tasks=sortperm([length(b.matrix) for b in packets];rev=true)
+    neartasks=.-sortperm([length(b.matrix) for b in nearpackets];rev=true)
     maxrows=maximum((size(b.matrix,1) for b in nearpackets);init=0)
-    H2PacketMatvecPlan(p.shape,p.rows,p.cols,packets,nearpackets,tasks,
+    H2PacketMatvecPlan(p.shape,p.rows,p.cols,packets,nearpackets,tasks,neartasks,
         _tree_schedule(p.rows,rorder,rspans,none,Vector{_SlotRef}[]),_tree_schedule(p.cols,corder,cspans,cnone,Vector{_SlotRef}[]),
         _tree_schedule(p.rows,rorder,rspans,rowrefs,extra),_tree_schedule(p.cols,corder,cspans,colrefs,Vector{_SlotRef}[]),
         workers,zeros(length(p.rowcoeff)),zeros(length(p.colcoeff)),zeros(length(p.rowbuffer)),zeros(length(p.colbuffer)),
@@ -369,7 +373,8 @@ function _packet_mul!(y,p::H2PacketMatvecPlan,x,alpha,beta,t)
     end
     @inbounds for i in eachindex(input);input[i]=x[ip[i]];end
     fill!(output,0.);fill!(outputcoeff,0.)
-    _run_tasks!((k,w)->_up_job!(inputcoeff,inputnodes,input,up,k),p,length(up.jobs))
+    nup=length(up.jobs)
+    _run_tasks!((k,w)->k<=nup ? _up_job!(inputcoeff,inputnodes,input,up,k) : _interaction_task!(p,p.neartasks[k-nup],w,t),p,nup+length(p.neartasks))
     _run_tasks!((k,w)->_interaction_task!(p,p.tasks[k],w,t),p,length(p.tasks))
     _run_tasks!((k,w)->_down_job!(output,outputcoeff,reduced,p.slots,outputnodes,down,k),p,length(down.jobs))
     @inbounds for i in eachindex(output)
@@ -386,7 +391,7 @@ function storage_bytes(p::H2PacketMatvecPlan)
     sum((sizeof(b.matrix) for b in p.nearpackets);init=0)+sum((sizeof(b.matrix) for b in p.packets);init=0)
 end
 function Base.copy(p::H2PacketMatvecPlan)
-    H2PacketMatvecPlan(p.shape,p.rows,p.cols,p.packets,p.nearpackets,p.tasks,p.rowup,p.colup,p.rowdown,p.coldown,p.workers,
+    H2PacketMatvecPlan(p.shape,p.rows,p.cols,p.packets,p.nearpackets,p.tasks,p.neartasks,p.rowup,p.colup,p.rowdown,p.coldown,p.workers,
         zeros(length(p.rowcoeff)),zeros(length(p.colcoeff)),zeros(length(p.rowbuffer)),zeros(length(p.colbuffer)),
         zeros(length(p.slots)),[zeros(length(s)) for s in p.scratch],p.rowperm,p.colperm,Threads.Atomic{Int}(0),_MultiWorkspace())
 end

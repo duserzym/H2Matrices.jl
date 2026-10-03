@@ -198,7 +198,8 @@ function _packet_block!(Y,p::H2PacketMatvecPlan,X,alpha,beta,t,ws,c0,K)
     @inbounds for v in 1:K, i in 1:li;input[i+(v-1)*li]=X[ip[i],c0+v];end
     @inbounds for i in 1:lo*K;output[i]=0.;end
     @inbounds for i in 1:loc*K;outputcoeff[i]=0.;end
-    _run_tasks!((k,w)->_up_job_k!(inputcoeff,lic,inputnodes,input,li,up,k,K),p,length(up.jobs))
+    nup=length(up.jobs)
+    _run_tasks!((k,w)->k<=nup ? _up_job_k!(inputcoeff,lic,inputnodes,input,li,up,k,K) : _interaction_task_k!(p,ws,p.neartasks[k-nup],w,t,K),p,nup+length(p.neartasks))
     _run_tasks!((k,w)->_interaction_task_k!(p,ws,p.tasks[k],w,t,K),p,length(p.tasks))
     _run_tasks!((k,w)->_down_job_k!(output,lo,outputcoeff,loc,reduced,lr,ws.slots,length(p.slots),outputnodes,down,k,K),p,length(down.jobs))
     @inbounds for v in 1:K, i in 1:lo
