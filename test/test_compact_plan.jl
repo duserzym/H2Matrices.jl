@@ -78,3 +78,63 @@ end
         end
     end
 end
+@testset "Pass-through bases and factor-keeping packets" begin
+    rng=MersenneTwister(7)
+    pts=[SVector(cos(2π*t)*(1+0.2rand(rng)),sin(2π*t)*(1+0.2rand(rng)),rand(rng)) for t in rand(rng,1200)]
+    K=KernelMatrix(pts,pts) do x,y
+        r=norm(x-y);r==0 ? 0.0 : inv(r)
+    end
+    tree=ClusterTree(copy(pts),GeometricSplitter(;nmax=16))
+    H=assemble_hmatrix(K,tree,tree;comp=PartialACA(;rtol=1e-10),threads=false,global_index=true)
+    C=compress_hmatrix_to_h2(H;rtol=1e-9,maxrank=1200,strict=true,_print=false)
+    M=Matrix(C);x=randn(rng,1200);z=randn(rng,1200)
+    base=H2CompactMatvecPlan(C)
+    P=H2CompactMatvecPlan(C;passthrough=true)
+    @test any(n->n.passthrough,P.rows) && any(n->n.passthrough,P.cols)
+    @test !any(n->n.passthrough,base.rows)
+    @test storage_bytes(P)<storage_bytes(base)
+    for A in (P,H2PacketMatvecPlan(P;workers=1),H2PacketMatvecPlan(P;workers=4))
+        for (B,input,expected) in ((A,x,M*x),(transpose(A),z,M'*z),(adjoint(A),z,M'*z))
+            @test B*input ≈ expected rtol=1e-12
+            y=randn(rng,1200);old=copy(y)
+            mul!(y,B,input,1.7,-0.3)
+            @test y ≈ 1.7expected-0.3old rtol=1e-12
+        end
+        @test dot(z,A*x) ≈ dot(adjoint(A)*z,x) rtol=1e-13
+        Q=copy(A);@test Q*x ≈ A*x rtol=1e-14
+    end
+    function allocations(A,x,y)
+        mul!(y,A,x)
+        @allocated mul!(y,A,x)
+    end
+    if VERSION>=v"1.10"
+        @test allocations(P,x,zeros(1200))==0
+        @test allocations(adjoint(P),x,zeros(1200))==0
+        @test allocations(H2PacketMatvecPlan(P),x,zeros(1200))==0
+        @test allocations(adjoint(H2PacketMatvecPlan(P)),x,zeros(1200))==0
+    end
+    # Factorized couplings stay factorized inside packets.
+    for pt in (false,true),scale in (:block,:global)
+        F=H2CompactMatvecPlan(C;coupling_rtol=1e-8,coupling_scale=scale,passthrough=pt)
+        @test any(b->b.R!==nothing,F.couplings)
+        kept=H2PacketMatvecPlan(F;workers=4);dense=H2PacketMatvecPlan(F;workers=4,keep_factors=false)
+        @test any(b->!isempty(b.factors),kept.packets)
+        @test storage_bytes(kept)==storage_bytes(F)
+        @test storage_bytes(kept)<storage_bytes(dense)
+        for (B,input,ref) in ((kept,x,F*x),(adjoint(kept),z,adjoint(F)*z),(dense,x,F*x))
+            @test B*input ≈ ref rtol=1e-13
+        end
+        @test norm(kept*x-M*x)/norm(M*x)<1e-6
+        @test dot(z,kept*x) ≈ dot(adjoint(kept)*z,x) rtol=1e-13
+        Q=copy(kept)
+        @test all(b.factors===c.factors && b.scratch!==c.scratch for (b,c) in zip(kept.packets,Q.packets))
+        if VERSION>=v"1.10"
+            single=H2PacketMatvecPlan(F)
+            @test allocations(single,x,zeros(1200))==0
+            @test allocations(adjoint(single),x,zeros(1200))==0
+        end
+    end
+    @test storage_bytes(H2CompactMatvecPlan(C;coupling_rtol=1e-8,coupling_scale=:global))<=
+        storage_bytes(H2CompactMatvecPlan(C;coupling_rtol=1e-8))
+    @test_throws ArgumentError H2CompactMatvecPlan(C;coupling_rtol=1e-8,coupling_scale=:relative)
+end

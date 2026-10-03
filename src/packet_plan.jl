@@ -1,12 +1,20 @@
+# A packet applies `matrix * [segment_1; segment_2; ...]` to one row coefficient
+# range. A direct segment gathers column coefficients; a factored segment
+# (`factors[i]` nonempty, `direct[i]==false`) stores the right factor `R` of
+# `S = L*R'` and contributes `R'*x` while `L` lives in `matrix`. An empty
+# `factors` vector marks an all-direct packet.
 struct _CouplingPacket
     matrix::Matrix{Float64}
     row::UnitRange{Int}
     columns::Vector{UnitRange{Int}}
     scratch::Vector{Float64}
+    factors::Vector{Matrix{Float64}}
 end
+_CouplingPacket(matrix,row,columns,scratch)=_CouplingPacket(matrix,row,columns,scratch,Matrix{Float64}[])
+_copy_packet(b::_CouplingPacket)=_CouplingPacket(b.matrix,b.row,b.columns,zeros(length(b.scratch)),b.factors)
 """
     H2PacketMatvecPlan(h2; workers=1)
-    H2PacketMatvecPlan(compact_plan; workers=1)
+    H2PacketMatvecPlan(compact_plan; workers=1, keep_factors=true)
 
 Pack interactions with the same row basis into contiguous GEMV packets.
 Packing does not truncate data. Combined with implicit saturated bases, it
@@ -15,6 +23,11 @@ are retained without the source operator. `workers>1` partitions packets
 among tasks, including near-field packets with disjoint output ranges,
 with separate transpose reduction buffers and deterministic
 worker-order reduction. Use BLAS threads=1 when enabling packet workers.
+
+Couplings factorized by `H2CompactMatvecPlan(h2; coupling_rtol)` keep their
+factors (`S = L*R'`): left factors join the packet matrix and right factors
+are applied per segment, so the packet stores exactly the compact plan's
+numbers. `keep_factors=false` re-materializes `L*R'` instead.
 
 One plan is not safe for concurrent calls; `copy(plan)` shares numerical data
 and allocates independent scratch for an additional caller. Source data must
@@ -37,7 +50,7 @@ struct H2PacketMatvecPlan <: AbstractMatrix{Float64}
     nearpartials::Vector{Vector{Float64}}
 end
 H2PacketMatvecPlan(h::H2Matrix;workers::Int=1)=H2PacketMatvecPlan(H2CompactMatvecPlan(h);workers)
-function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1)
+function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1,keep_factors::Bool=true)
     workers>0 || throw(ArgumentError("workers must be positive"))
     groups=Dict{Int,Vector{Int}}();order=Int[]
     for (i,b) in enumerate(p.couplings)
@@ -48,15 +61,20 @@ function H2PacketMatvecPlan(p::H2CompactMatvecPlan;workers::Int=1)
     end
     packets=_CouplingPacket[]
     for row in order
-        columns=UnitRange{Int}[];blocks=Matrix{Float64}[]
+        columns=UnitRange{Int}[];blocks=Matrix{Float64}[];factors=Matrix{Float64}[];anyfactor=false
         for i in groups[row]
             b=p.couplings[i]
             push!(columns,p.cols[b.col].coeff)
-            S=b isa _PlanCoupling ? b.S : (b.R===nothing ? b.L : b.L*b.R')
-            push!(blocks,S)
+            if b isa _PlanCoupling || b.R===nothing
+                push!(blocks,b isa _PlanCoupling ? b.S : b.L);push!(factors,zeros(0,0))
+            elseif keep_factors
+                push!(blocks,b.L);push!(factors,b.R);anyfactor=true
+            else
+                push!(blocks,b.L*b.R');push!(factors,zeros(0,0))
+            end
         end
-        matrix=hcat(blocks...)
-        push!(packets,_CouplingPacket(matrix,p.rows[row].coeff,columns,zeros(size(matrix,2))))
+        matrix=reduce(hcat,blocks)
+        push!(packets,_CouplingPacket(matrix,p.rows[row].coeff,columns,zeros(size(matrix,2)),anyfactor ? factors : Matrix{Float64}[]))
     end
     neargroups=Dict{UnitRange{Int},Vector{Int}}();nearorder=UnitRange{Int}[]
     for (i,b) in enumerate(p.dense)
@@ -78,18 +96,46 @@ end
 Base.size(p::H2PacketMatvecPlan)=p.shape
 function _packet_forward!(rowcoeff,b::_CouplingPacket,colcoeff)
     offset=0
-    for cr in b.columns
-        for (i,j) in enumerate(cr);b.scratch[offset+i]=colcoeff[j];end
-        offset+=length(cr)
+    if isempty(b.factors)
+        for cr in b.columns
+            for (i,j) in enumerate(cr);b.scratch[offset+i]=colcoeff[j];end
+            offset+=length(cr)
+        end
+    else
+        for (s,cr) in enumerate(b.columns)
+            R=b.factors[s]
+            if size(R,1)==0
+                for (i,j) in enumerate(cr);b.scratch[offset+i]=colcoeff[j];end
+                offset+=length(cr)
+            else
+                r=size(R,2)
+                r>0 && mul!(view(b.scratch,offset+1:offset+r),R',view(colcoeff,cr))
+                offset+=r
+            end
+        end
     end
     mul!(view(rowcoeff,b.row),b.matrix,b.scratch,1.,1.)
 end
 function _packet_transpose!(colcoeff,b::_CouplingPacket,rowcoeff)
     mul!(b.scratch,b.matrix',view(rowcoeff,b.row))
     offset=0
-    for cr in b.columns
-        for (i,j) in enumerate(cr);colcoeff[j]+=b.scratch[offset+i];end
-        offset+=length(cr)
+    if isempty(b.factors)
+        for cr in b.columns
+            for (i,j) in enumerate(cr);colcoeff[j]+=b.scratch[offset+i];end
+            offset+=length(cr)
+        end
+    else
+        for (s,cr) in enumerate(b.columns)
+            R=b.factors[s]
+            if size(R,1)==0
+                for (i,j) in enumerate(cr);colcoeff[j]+=b.scratch[offset+i];end
+                offset+=length(cr)
+            else
+                r=size(R,2)
+                r>0 && mul!(view(colcoeff,cr),R,view(b.scratch,offset+1:offset+r),1.,1.)
+                offset+=r
+            end
+        end
     end
 end
 function _packet_worker!(p,worker,transposed)
@@ -170,11 +216,12 @@ LinearAlgebra.mul!(y::AbstractVector,p::TransposedPacketH2Plan,x::AbstractVector
 Base.:*(p::Union{H2PacketMatvecPlan,TransposedPacketH2Plan},x::AbstractVector)=mul!(zeros(size(p,1)),p,x)
 function storage_bytes(p::H2PacketMatvecPlan)
     sum((sizeof(n.V)+sizeof(n.E) for ns in (p.rows,p.cols) for n in ns);init=0)+
-    sum((sizeof(b.matrix) for b in p.nearpackets);init=0)+sum((sizeof(b.matrix) for b in p.packets);init=0)
+    sum((sizeof(b.matrix) for b in p.nearpackets);init=0)+
+    sum((sizeof(b.matrix)+sum(sizeof,b.factors;init=0) for b in p.packets);init=0)
 end
 function Base.copy(p::H2PacketMatvecPlan)
-    packets=[_CouplingPacket(b.matrix,b.row,b.columns,zeros(length(b.scratch))) for b in p.packets]
-    nearpackets=[_CouplingPacket(b.matrix,b.row,b.columns,zeros(length(b.scratch))) for b in p.nearpackets]
+    packets=[_copy_packet(b) for b in p.packets]
+    nearpackets=[_copy_packet(b) for b in p.nearpackets]
     H2PacketMatvecPlan(p.shape,p.rows,p.cols,packets,nearpackets,p.near_parallel,
         zeros(length(p.rowcoeff)),zeros(length(p.colcoeff)),zeros(length(p.rowbuffer)),zeros(length(p.colbuffer)),p.rowperm,p.colperm,
         [zeros(length(v)) for v in p.partials],[zeros(length(v)) for v in p.nearpartials])

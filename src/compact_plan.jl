@@ -1,5 +1,8 @@
 # Saturated bases can be represented in physical coordinates without a
 # truncation. Their effects move into couplings and unsaturated-parent transfers.
+# A pass-through node uses the concatenated coefficients of its children as its
+# coefficients: its transfer from the children is folded into its couplings and
+# its own transfer to the parent, which is exact up to rounding.
 struct _CompactBasisNode
     V::Matrix{Float64}
     E::Matrix{Float64}
@@ -7,8 +10,13 @@ struct _CompactBasisNode
     indices::UnitRange{Int}
     children::Vector{Int}
     identity::Bool
+    passthrough::Bool
 end
-function _compact_basis(root)
+_CompactBasisNode(V,E,coeff,indices,children,identity)=_CompactBasisNode(V,E,coeff,indices,children,identity,false)
+# `weights[cb]` is the summed coefficient width of the coupling partners of
+# `cb`. With weights, an internal node becomes pass-through when this lowers
+# the stored numbers: (D-k)(k_parent+W) < D*k for D child coefficients.
+function _compact_basis(root,weights=nothing)
     originals=typeof(root)[]
     function visit(cb)
         push!(originals,cb)
@@ -20,30 +28,60 @@ function _compact_basis(root)
     for cb in originals
         if cb.k>=length(cb) && cb.k>0
             saturated[cb]=_full_basis(cb)
+        elseif weights!==nothing && isleaf(cb) && cb.k>0
+            # The same storage rule with D=|t|: physical coordinates for a
+            # nearly saturated leaf whose few couplings do not amortize V.
+            m=length(cb);kp=isroot(cb) || haskey(saturated,cb.parent) ? 0 : cb.parent.k
+            (m-cb.k)*(kp+get(weights,cb,0))<m*cb.k && (saturated[cb]=cb.V)
+        end
+    end
+    # Expansion of a node's own k coefficients into the coordinates it uses.
+    expand=IdDict{typeof(root),Matrix{Float64}}(saturated)
+    passthrough=IdDict{typeof(root),Int}()
+    if weights!==nothing
+        dims=IdDict{typeof(root),Int}()
+        for cb in Iterators.reverse(originals)
+            if haskey(saturated,cb)
+                dims[cb]=length(cb)
+            elseif isleaf(cb) || cb.k==0
+                dims[cb]=cb.k
+            else
+                active=[c for c in cb.children if dims[c]>0]
+                D=sum((dims[c] for c in active);init=0)
+                kp=isroot(cb) || haskey(saturated,cb.parent) ? 0 : cb.parent.k
+                W=get(weights,cb,0)
+                if D>0 && (D-cb.k)*(kp+W)<D*cb.k
+                    expand[cb]=reduce(vcat,[haskey(expand,c) ? expand[c]*c.E : c.E for c in active])
+                    passthrough[cb]=D;dims[cb]=D
+                else
+                    dims[cb]=cb.k
+                end
+            end
         end
     end
     nodes=_CompactBasisNode[];offset=first(index_range(root.cluster))-1;total=0
     for cb in originals
-        identity=haskey(saturated,cb)
-        k=identity ? length(cb) : cb.k
+        identity=haskey(saturated,cb);pass=haskey(passthrough,cb)
+        k=identity ? length(cb) : pass ? passthrough[cb] : cb.k
         cr=total+1:total+k;total+=k
         # Transfers to a saturated parent are unused: that parent's basis
         # expands directly in physical coordinates rather than through children.
-        E=if isroot(cb) || haskey(saturated,cb.parent)
+        # A pass-through parent copies child coefficients instead.
+        E=if isroot(cb) || haskey(saturated,cb.parent) || haskey(passthrough,cb.parent)
             zeros(Float64,0,0)
-        elseif identity
-            saturated[cb]*cb.E
+        elseif haskey(expand,cb)
+            expand[cb]*cb.E
         else
             cb.E
         end
-        V=identity ? zeros(Float64,0,0) : cb.V
+        V=identity || pass ? zeros(Float64,0,0) : cb.V
         push!(nodes,_CompactBasisNode(V,E,cr,index_range(cb.cluster).-offset,
-            [ids[c] for c in cb.children],identity))
+            [ids[c] for c in cb.children],identity,pass))
     end
-    nodes,ids,saturated,zeros(total)
+    nodes,ids,expand,zeros(total)
 end
 """
-    H2CompactMatvecPlan(h2; coupling_rtol=nothing)
+    H2CompactMatvecPlan(h2; coupling_rtol=nothing, coupling_scale=:block, passthrough=false)
 
 Compact reusable matvec representation of the stored H2 operator. Saturated
 cluster bases (rank at least cluster size) are replaced by implicit identity
@@ -51,8 +89,20 @@ bases; their numerical action is moved to couplings and parent transfers.
 This is an algebraic representation change with only floating-point rounding,
 not a tolerance relaxation. Works for nonorthogonal and overcomplete bases.
 
+`passthrough=true` additionally lets an internal basis node use its children's
+concatenated coefficients when that stores fewer numbers: its transfer
+matrices are folded into its couplings and into its own transfer to the
+parent. This is also exact up to rounding and mainly removes nearly square
+transfer matrices of weakly compressing upper levels that serve few couplings.
+
 An optional `coupling_rtol` additionally enables local SVD coupling truncation,
 which is an approximation and requires separate application validation.
+With `coupling_scale=:block` (default) singular values below `coupling_rtol`
+times the coupling's own largest singular value are discarded. With
+`coupling_scale=:global` the threshold is `coupling_rtol` times the largest
+singular value over all stored couplings, so weak blocks are not resolved to
+a tighter absolute accuracy than strong ones. A coupling is factorized only
+when its factors use less storage than the coupling itself.
 The plan retains numerical data but not the source operator or unused bases.
 Its adjoint applies the same stored approximation. Use one plan per concurrent
 worker and do not mutate shared source data while a plan is in use.
@@ -70,39 +120,82 @@ struct H2CompactMatvecPlan{C} <: AbstractMatrix{Float64}
     rowperm::Vector{Int}
     colperm::Vector{Int}
 end
-function _factor_plan_coupling(S,row,col,rtol)
-    F=svd(S);k=_truncation_rank(F.S,rtol,min(size(S)...))
+# Independent per-item work (e.g. local SVDs) on the available threads; the
+# result does not depend on scheduling.
+function _threaded_map(f,::Type{T},items) where {T}
+    out=Vector{T}(undef,length(items))
+    next=Threads.Atomic{Int}(1)
+    @sync for _ in 1:min(Threads.nthreads(),max(length(items),1))
+        Threads.@spawn while true
+            i=Threads.atomic_add!(next,1)
+            i>length(items) && break
+            out[i]=f(items[i])
+        end
+    end
+    out
+end
+# `scale===nothing`: block-relative threshold; otherwise absolute `rtol*scale`.
+# A coupling is replaced by factors only when they are cheaper to store.
+function _factor_plan_coupling(S,row,col,rtol,scale=nothing)
+    isempty(S) && return _LowRankPlanCoupling(S,nothing,Float64[],row,col)
+    F=svd(S)
+    k=scale===nothing ? _truncation_rank(F.S,rtol,min(size(S)...)) : count(>(rtol*scale),F.S)
     if k*sum(size(S))<length(S)
         _LowRankPlanCoupling(F.U[:,1:k]*Diagonal(F.S[1:k]),F.V[:,1:k],zeros(k),row,col)
     else
         _LowRankPlanCoupling(S,nothing,Float64[],row,col)
     end
 end
-function H2CompactMatvecPlan(h2::H2Matrix;coupling_rtol::Union{Nothing,Float64}=nothing)
+function H2CompactMatvecPlan(h2::H2Matrix;coupling_rtol::Union{Nothing,Float64}=nothing,coupling_scale::Symbol=:block,
+                             passthrough::Bool=false)
     coupling_rtol===nothing || (isfinite(coupling_rtol) && coupling_rtol>=0) ||
         throw(ArgumentError("coupling_rtol must be finite and nonnegative"))
-    rows,ri,ru,rc=_compact_basis(h2.row_basis)
-    cols,ci,cu,cc=_compact_basis(h2.col_basis)
-    couplings=coupling_rtol===nothing ? _PlanCoupling[] : _LowRankPlanCoupling[]
-    dense=_PlanDense[]
-    function visit(h)
+    coupling_scale in (:block,:global) || throw(ArgumentError("coupling_scale must be :block or :global"))
+    blocks=Tuple{typeof(h2.row_basis),typeof(h2.col_basis),UniformBlock}[];denseblocks=typeof(h2)[]
+    function collect_blocks(h)
         if isleaf(h)
             if h.uniform!==nothing
-                S=h.uniform.S
-                # Physical row expansion and column projection of the original
-                # basis are preserved, without relying on its orthogonality.
-                haskey(ru,h.row_basis) && (S=ru[h.row_basis]*S)
-                haskey(cu,h.col_basis) && (S=S*cu[h.col_basis]')
-                r=ri[h.row_basis];c=ci[h.col_basis]
-                push!(couplings,coupling_rtol===nothing ? _PlanCoupling(S,r,c) : _factor_plan_coupling(S,r,c,coupling_rtol))
+                push!(blocks,(h.row_basis,h.col_basis,h.uniform))
             elseif h.dense!==nothing
-                push!(dense,_PlanDense(h.dense,rows[ri[h.row_basis]].indices,cols[ci[h.col_basis]].indices))
+                push!(denseblocks,h)
             end
         else
-            foreach(visit,h.children)
+            foreach(collect_blocks,h.children)
         end
     end
-    visit(h2)
+    collect_blocks(h2)
+    rowweights=colweights=nothing
+    if passthrough
+        width(cb)=cb.k>=length(cb) && cb.k>0 ? length(cb) : cb.k
+        rowweights=IdDict{typeof(h2.row_basis),Int}()
+        for (r,c,_) in blocks;rowweights[r]=get(rowweights,r,0)+width(c);end
+    end
+    rows,ri,ru,rc=_compact_basis(h2.row_basis,rowweights)
+    if passthrough
+        colweights=IdDict{typeof(h2.col_basis),Int}()
+        for (r,c,_) in blocks;colweights[c]=get(colweights,c,0)+length(rows[ri[r]].coeff);end
+    end
+    cols,ci,cu,cc=_compact_basis(h2.col_basis,colweights)
+    exact=_PlanCoupling[]
+    dense=_PlanDense[]
+    for (r,c,u) in blocks
+        S=u.S
+        # Physical row expansion and column projection of the original
+        # basis are preserved, without relying on its orthogonality.
+        haskey(ru,r) && (S=ru[r]*S)
+        haskey(cu,c) && (S=S*cu[c]')
+        push!(exact,_PlanCoupling(S,ri[r],ci[c]))
+    end
+    for h in denseblocks
+        push!(dense,_PlanDense(h.dense,rows[ri[h.row_basis]].indices,cols[ci[h.col_basis]].indices))
+    end
+    couplings=if coupling_rtol===nothing
+        exact
+    else
+        norms=coupling_scale===:global ? _threaded_map(b->isempty(b.S) ? 0. : opnorm(b.S),Float64,exact) : Float64[]
+        scale=coupling_scale===:global ? maximum(norms;init=0.) : nothing
+        _threaded_map(b->_factor_plan_coupling(b.S,b.row,b.col,coupling_rtol,scale),_LowRankPlanCoupling,exact)
+    end
     rp=h2.global_index ? collect(loc2glob(h2.row_basis.cluster)) : collect(1:size(h2,1))
     cp=h2.global_index ? collect(loc2glob(h2.col_basis.cluster)) : collect(1:size(h2,2))
     H2CompactMatvecPlan(size(h2),rows,cols,couplings,dense,rc,cc,zeros(size(h2,1)),zeros(size(h2,2)),rp,cp)
@@ -117,6 +210,13 @@ function _plan_up!(coeff,nodes::Vector{_CompactBasisNode},x)
             copyto!(dest,view(x,n.indices))
         elseif isempty(n.children)
             mul!(dest,n.V',view(x,n.indices))
+        elseif n.passthrough
+            offset=first(n.coeff)-1
+            for j in n.children
+                child=nodes[j];isempty(child.coeff) && continue
+                for (a,b) in enumerate(child.coeff);coeff[offset+a]=coeff[b];end
+                offset+=length(child.coeff)
+            end
         else
             for j in n.children
                 child=nodes[j];isempty(child.coeff) && continue
@@ -133,6 +233,13 @@ function _plan_down!(y,coeff,nodes::Vector{_CompactBasisNode})
             for i in eachindex(dest);dest[i]+=src[i];end
         elseif isempty(n.children)
             mul!(view(y,n.indices),n.V,view(coeff,n.coeff),1.,1.)
+        elseif n.passthrough
+            offset=first(n.coeff)-1
+            for j in n.children
+                child=nodes[j];isempty(child.coeff) && continue
+                for (a,b) in enumerate(child.coeff);coeff[b]+=coeff[offset+a];end
+                offset+=length(child.coeff)
+            end
         else
             for j in n.children
                 child=nodes[j];isempty(child.coeff) && continue
