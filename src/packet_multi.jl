@@ -112,6 +112,13 @@ function _up_job_k!(coeff,lc,nodes,x,lx,tree::_TreeSchedule,k,K)
         if n.identity
             i0=first(n.indices)-1
             for v in 0:K-1, i in 1:len;coeff[c0+i+v*lc]=x[i0+i+v*lx];end
+        elseif n.passthrough
+            for j in n.children
+                child=nodes[j];isempty(child.coeff) && continue
+                d0=first(child.coeff)-1
+                for v in 0:K-1, i in 1:length(child.coeff);coeff[c0+i+v*lc]=coeff[d0+i+v*lc];end
+                c0+=length(child.coeff)
+            end
         else
             for v in 0:K-1, i in 1:len;coeff[c0+i+v*lc]=0.;end
             if isempty(n.children)
@@ -142,6 +149,15 @@ function _down_job_k!(y,ly,coeff,lc,dest,ld,slots,ls,nodes,tree::_TreeSchedule,k
             for v in 0:K-1
                 @simd for i in 1:length(n.coeff);y[i0+i+v*ly]+=coeff[c0+i+v*lc];end
             end
+        elseif n.passthrough
+            for j in n.children
+                child=nodes[j];isempty(child.coeff) && continue
+                d0=first(child.coeff)-1
+                for v in 0:K-1
+                    @simd for i in 1:length(child.coeff);coeff[d0+i+v*lc]+=coeff[c0+i+v*lc];end
+                end
+                c0+=length(child.coeff)
+            end
         elseif isempty(n.children)
             _kernel_nk!(y,first(n.indices)-1,ly,n.V,0,size(n.V,2),coeff,c0,lc,K)
         else
@@ -152,20 +168,80 @@ function _down_job_k!(y,ly,coeff,lc,dest,ld,slots,ls,nodes,tree::_TreeSchedule,k
         end
     end
 end
+# Z[1:r, v] .*= c (column stride r)
+@inline function _scale_rows_k!(Z,c,r,K)
+    @inbounds for v in 0:K-1, i in 1:r;Z[i+v*r]*=c[i];end
+    nothing
+end
+# Several right-hand sides: as `_part_forward!`, inner vectors of factored
+# segments are r × K blocks (column stride r) in the worker scratch `Z`.
+function _part_forward_k!(rowcoeff,y0,lrc,q::_PacketPart,colcoeff,lcc,Z,K)
+    M=q.matrix;offset=0;direct=isempty(q.factors);scaled=!isempty(q.scales)
+    @inbounds for (s,cr) in enumerate(q.columns)
+        R=direct ? q.matrix : q.factors[s]
+        if direct || size(R,1)==0
+            _kernel_nk!(rowcoeff,y0,lrc,M,offset,length(cr),colcoeff,first(cr)-1,lcc,K)
+            offset+=length(cr)
+        else
+            r=size(R,2)
+            for i in 1:r*K;Z[i]=0.;end
+            _kernel_tk!(Z,0,r,R,0,r,colcoeff,first(cr)-1,lcc,K)
+            if scaled
+                c=q.scales[s];isempty(c) || _scale_rows_k!(Z,c,r,K)
+            end
+            _kernel_nk!(rowcoeff,y0,lrc,M,offset,r,Z,0,r,K)
+            offset+=r
+        end
+    end
+    nothing
+end
+function _part_adjoint_k!(slots,s0,ls,q::_PacketPart,rowcoeff,y0,lrc,Z,K)
+    M=q.matrix;offset=0;direct=isempty(q.factors);scaled=!isempty(q.scales)
+    @inbounds for (s,cr) in enumerate(q.columns)
+        o=s0+q.offsets[s]
+        R=direct ? q.matrix : q.factors[s]
+        if direct || size(R,1)==0
+            _kernel_tk!(slots,o,ls,M,offset,length(cr),rowcoeff,y0,lrc,K)
+            offset+=length(cr)
+        else
+            r=size(R,2)
+            for i in 1:r*K;Z[i]=0.;end
+            _kernel_tk!(Z,0,r,M,offset,r,rowcoeff,y0,lrc,K)
+            if scaled
+                c=q.scales[s];isempty(c) || _scale_rows_k!(Z,c,r,K)
+            end
+            _kernel_nk!(slots,o,ls,R,0,r,Z,0,r,K)
+            offset+=r
+        end
+    end
+    nothing
+end
 function _interaction_task_k!(p,ws,k,w,t,K)
     lrc=length(p.rowcoeff);lcc=length(p.colcoeff);lrb=length(p.rowbuffer);lcb=length(p.colbuffer);ls=length(p.slots)
     if k>0
-        b=p.packets[k];M=b.matrix
+        b=p.packets[k];M=b.matrix;y0=first(b.row)-1
         if t
             s=ws.slots
-            @inbounds for v in 0:K-1, j in 1:size(M,2);s[b.slot+j+v*ls]=0.;end
-            _kernel_tk!(s,b.slot,ls,M,0,size(M,2),ws.rowcoeff,first(b.row)-1,lrc,K)
-        else
-            y0=first(b.row)-1;offset=0
+            @inbounds for v in 0:K-1, j in 1:b.width;s[b.slot+j+v*ls]=0.;end
+            if b.plain
+                _kernel_tk!(s,b.slot,ls,M,0,size(M,2),ws.rowcoeff,y0,lrc,K)
+            else
+                Z=ws.scratch[w]
+                _part_adjoint_k!(s,b.slot,ls,b.f64,ws.rowcoeff,y0,lrc,Z,K)
+                _part_adjoint_k!(s,b.slot,ls,b.f32,ws.rowcoeff,y0,lrc,Z,K)
+                _part_adjoint_k!(s,b.slot,ls,b.f16,ws.rowcoeff,y0,lrc,Z,K)
+            end
+        elseif b.plain
+            offset=0
             for cr in b.columns
                 _kernel_nk!(ws.rowcoeff,y0,lrc,M,offset,length(cr),ws.colcoeff,first(cr)-1,lcc,K)
                 offset+=length(cr)
             end
+        else
+            Z=ws.scratch[w]
+            _part_forward_k!(ws.rowcoeff,y0,lrc,b.f64,ws.colcoeff,lcc,Z,K)
+            _part_forward_k!(ws.rowcoeff,y0,lrc,b.f32,ws.colcoeff,lcc,Z,K)
+            _part_forward_k!(ws.rowcoeff,y0,lrc,b.f16,ws.colcoeff,lcc,Z,K)
         end
     else
         b=p.nearpackets[-k];M=b.matrix

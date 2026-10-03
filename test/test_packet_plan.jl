@@ -8,8 +8,9 @@
     rt=ClusterTree(copy(X),GeometricSplitter(;nmax=8));ct=ClusterTree(copy(Y),GeometricSplitter(;nmax=8))
     H=assemble_hmatrix(K,rt,ct;comp=PartialACA(;rtol=1e-12),threads=false,global_index=true)
     C=compress_hmatrix_to_h2(H;rtol=1e-11,maxrank=235,strict=true,_print=false)
-    for gi in (true,false),workers in (1,4),crtol in (nothing,1e-12)
-        C.global_index=gi;compact=H2CompactMatvecPlan(C;coupling_rtol=crtol)
+    for gi in (true,false),workers in (1,4),crtol in (nothing,1e-12),pt in (false,true),prec in (Float64,Float32,Float16)
+        prec!==Float64 && crtol===nothing && continue
+        C.global_index=gi;compact=H2CompactMatvecPlan(C;coupling_rtol=crtol,passthrough=pt,coupling_precision=prec)
         P=H2PacketMatvecPlan(compact;workers);M=Matrix(C;global_index=gi)
         @test !(:h2 in fieldnames(typeof(P)))
         crtol===nothing && @test storage_bytes(P)==storage_bytes(compact)
