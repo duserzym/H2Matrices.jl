@@ -1,0 +1,17 @@
+grain,boundary_nodes,settings,build_s,stored_MB,maxrss_before_build_MB,maxrss_after_build_MB,sampled_peak_live_heap_MB,energy_gradient_ms,forward_ms,adjoint_ms,nine_rhs_forward_ms_per_vector,nine_rhs_adjoint_ms_per_vector
+PLAG066,6028,previous (v0.1.x validated),3.96,302.8,2143,2924,673.4,14.82,1.78,1.44,0.59,0.51
+PLAG066,6028,recommended,4.43,246.8,2112,3004,723.0,14.73,1.53,1.43,0.61,0.72
+PLAG066,6028,recommended + format48,4.37,212.2,2104,2751,694.2,15.08,1.62,1.57,0.80,0.79
+PLAG066,6028,recommended with Float64 packets,3.91,289.0,2035,2880,676.1,15.24,1.74,1.38,0.59,0.49
+PLAG036,12415,previous (v0.1.x validated),15.31,714.8,2517,4336,1936.8,26.63,4.34,3.89,1.31,1.21
+PLAG036,12415,recommended,47.70,650.1,2366,6029,3848.1,27.12,4.42,4.14,1.78,1.77
+PLAG036,12415,recommended + format48,48.31,586.9,2422,5604,3645.8,28.13,4.99,4.76,1.99,1.96
+PLAG036,12415,recommended with Float64 packets,45.49,771.0,2378,5981,3654.6,27.10,4.85,4.16,1.44,1.45
+PLAG022,17875,previous (v0.1.x validated),43.32,1511.5,3192,6258,4030.1,57.61,9.68,8.22,2.62,2.55
+PLAG022,17875,recommended,124.66,1262.6,2881,8443,7099.8,56.44,7.94,7.55,2.98,2.96
+PLAG022,17875,recommended + format48,135.22,1133.4,2866,7185,7670.6,57.67,8.37,8.07,3.69,3.69
+PLAG022,17875,recommended with Float64 packets,124.05,1541.4,3151,7009,7234.6,58.04,8.96,7.92,2.72,2.56
+PLAG012,30321,previous (v0.1.x validated),58.87,3555.1,6122,7381,6357.0,221.93,22.63,18.29,5.95,5.78
+PLAG012,30321,recommended,219.52,3226.1,7713,10177,15778.2,207.34,17.19,16.96,7.08,7.16
+PLAG012,30321,recommended + format48,237.82,2855.1,7809,9595,15691.4,215.93,19.35,19.12,8.97,9.20
+PLAG012,30321,recommended with Float64 packets,214.82,4186.6,7592,11401,15170.2,221.83,25.10,21.59,7.05,6.55
