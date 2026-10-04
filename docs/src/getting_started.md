@@ -9,7 +9,7 @@ Install the tagged Git release:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.3")
+Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.2.0")
 ```
 
 ## Basic Workflow
@@ -96,6 +96,18 @@ h2 = assemble_h2matrix_adaptive(K, Xclt, Yclt; rtol=1e-6, maxrank=50)
 This first builds an H-matrix via ACA, then converts to H² format with shared
 nested bases.  The `rtol` parameter controls the approximation tolerance.
 
+!!! tip "Larger operators"
+    The conversion runs as Julia tasks when Julia has several threads and BLAS
+    uses one (`julia -t 8`, then `BLAS.set_num_threads(1)`); the result is
+    bitwise independent of the thread count. `threads=true` also threads the
+    H-matrix assembly (the kernel must allow concurrent evaluation).
+    `assemble_h2matrix_adaptive` releases its intermediate H-matrix block by
+    block while converting. For repeated products, build a packet plan with
+    `H2PacketMatvecPlan(h2; workers=4, passthrough=true, consume=true)`. When an
+    application needs the same absolute accuracy everywhere, see
+    [Accuracy and performance](accuracy_performance.md) for
+    `error_control=:global` and the mixed-precision plan.
+
 ### Step 5: Use the H²-Matrix
 
 **Matrix–vector product** (uses the O(N) three-phase algorithm):
@@ -145,7 +157,8 @@ approximation error within the specified tolerance.
 | `rtol`    | Relative truncation tolerance | `1e-4` to `1e-8` |
 | `maxrank` | Maximum rank per cluster | 30–100 |
 | `nmax`    | Max points per leaf cluster | 20–64 |
-| `η` (via `StrongAdmissibilityStd`) | Admissibility parameter | 2–3 |
+| `η` (via `StrongAdmissibilityStd`) | Admissibility parameter | 1.5–3 |
+| `error_control` | `:block` (each truncation relative to its own block or cluster) or `:global` (absolute, against one operator scale) | `:block` |
 
 **Rules of thumb:**
 - For 2D problems, `order=4` gives rank ``k = 16`` per cluster.

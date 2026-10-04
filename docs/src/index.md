@@ -4,20 +4,44 @@
 
 *Fast hierarchical matrix algebra with nested bases in Julia.*
 
-## Accuracy-preserving advances
+## Accuracy and performance advances
 
-The recent implementation first corrected nested-basis conversion and stored
-adjoints, then improved retained memory and repeated-product throughput using
-implicit saturated bases, reusable scratch and contiguous interaction packets.
-On a real 6,028-boundary-node PLAG066 grain, the selected four-worker plan uses
-302.75 MB versus 337.78 MB for corrected H² and 378.59 MB for H, while retaining
-the original ACA/basis tolerances. Generated LEM/NEB states have maximum
-H-reference torque discrepancy 5.50e-11 T.
+v0.1.x corrected nested-basis conversion and stored adjoints, then improved
+retained memory and repeated-product throughput using implicit saturated bases,
+reusable scratch and contiguous interaction packets. On a real
+6,028-boundary-node PLAG066 grain, the selected four-worker plan used 302.75 MB
+versus 337.78 MB for corrected H² and 378.59 MB for H, while retaining the
+original ACA/basis tolerances.
+
+**0.2.0** makes construction and products faster and adds storage and
+error-control options:
+
+- The H → H² conversion condenses ancestor interactions exactly, runs as Julia
+  tasks and releases the intermediate H-matrix while converting: 5.7-9 times
+  faster than v0.1.3 on four grains of 6,028-30,321 boundary nodes, for the
+  same operator up to rounding.
+- A new packet engine runs every product phase in parallel with explicit write
+  ownership (bitwise independent of the worker count) and applies several
+  right-hand sides per pass; four-worker products were 1.6-1.9 times faster.
+- Exact pass-through bases, optional coupling truncation with reduced-precision
+  tiers, and `H2MixedPacketMatvecPlan`, which stores low-weight rows in
+  Float32 under a rigorous a priori bound.
+- Opt-in absolute error control (`error_control=:global`).
+
+An application check found that the tolerances validated on PLAG066 are not
+enough on larger grains: their relative product errors stayed near 1e-10, but
+the tangent torque of Merrill's micromagnetic energy missed a 1e-9 T gate by up
+to 14 times on the 30,321-node PLAG012 grain. Absolute error control at a
+tighter tolerance with the mixed-precision plan met the gate on all four grains
+with 9-19% less storage than the previous operator, at 2.9-3.7 times the build
+time. The [practical guide](accuracy_performance.md#Recommended-settings-for-tight-absolute-accuracy)
+gives these settings.
 
 Read [how the advances work](advances.md), follow the
 [practical accuracy/performance guide](accuracy_performance.md), or inspect the
 [validation protocol and downloadable results](validation.md). The measurements
-cover one grain and path; retained storage is not peak assembly memory.
+cover four grains of one application on one machine; retained storage is not
+peak assembly memory.
 
 ## What is an H²-matrix?
 

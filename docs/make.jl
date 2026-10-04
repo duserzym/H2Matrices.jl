@@ -20,7 +20,7 @@ makedocs(;
         "Accuracy and Performance" => [
             "Practical Guide" => "accuracy_performance.md",
             "How the Advances Work" => "advances.md",
-            "PLAG066 Validation" => "validation.md",
+            "Validation (0.2.0, PLAG066 v0.1.x)" => "validation.md",
         ],
     ],
 )

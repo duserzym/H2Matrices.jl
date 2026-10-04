@@ -2,9 +2,11 @@
 
 The v0.1.1 numerical changes addressed two separate problems: lost information during nested compression, and unnecessary storage and work when applying the corrected operator. v0.1.2 keeps that implementation and requires Julia 1.13 or later. Raising the Julia requirement is a maintenance decision; the measured performance gains come from the representation and matvec changes described here.
 
+0.2.0 keeps the v0.1.1 accuracy fixes and adds a faster conversion that builds the same operator up to rounding ([below](#Condense-ancestor-interactions-during-conversion)), a new packet engine, exact pass-through bases, bounded mixed-precision storage and opt-in absolute error control. It also records an application finding: the tolerances validated on PLAG066 do not meet the same torque gate on larger grains, and absolute error control does ([Accuracy at scale](#Accuracy-at-scale:-absolute-rather-than-block-relative-error)).
+
 ![The progression from correct compression to compact parallel products](assets/advances.svg)
 
-The [PLAG066 validation](validation.md) provides the measured evidence. The [practical guide](accuracy_performance.md) shows how to use these APIs.
+The [validation page](validation.md) provides the measured evidence (four grains for 0.2.0, PLAG066 for v0.1.x). The [practical guide](accuracy_performance.md) shows how to use these APIs.
 
 ## Why a small compression tolerance was insufficient
 
@@ -59,6 +61,33 @@ The weighted factor `A * R_B'` measures the block through an orthonormal partner
 A parent with no direct or inherited far-field interactions does not need a basis merely because its children have their own local interactions. The corrected construction gives such a parent rank zero, while retaining the children's active bases and couplings. This avoids large identity embeddings that previously stored directions with no parent-level use.
 
 A zero-rank parent is not an empty subtree. Recompression now traverses its descendants. Otherwise, the corrected zero-rank root could cause an entire active tree to be skipped.
+
+## Condense ancestor interactions during conversion
+
+The corrected construction has a cost: a cluster's basis must represent its direct interactions and the restrictions of all its ancestors' interactions, so the v0.1.x builder passed every ancestor block down unchanged and the active widths grew with depth. On the larger grains the conversion took longer than the ACA stage (258 s on PLAG012 with v0.1.3).
+
+The basis of a cluster `t` is the dominant left singular subspace of
+
+```math
+C_t=\begin{bmatrix}D_t & D_{\mathrm{parent}}[t,:] & D_{\mathrm{grandparent}}[t,:] & \cdots\end{bmatrix},
+```
+
+with `D_s` the partner-weighted ACA factors of the blocks of cluster `s`. Its left singular vectors and values depend only on the Gram matrix `C_t C_tᵀ`. A thin QR factorization `C_tᵀ = Q R` gives `L_t = Rᵀ` with `L_t L_tᵀ = C_t C_tᵀ`, and every row restriction keeps that property, `L_t[r,:] L_t[r,:]ᵀ = C_t[r,:] C_t[r,:]ᵀ`. Each child therefore inherits `L_t[child,:]`, of width at most the cluster size, instead of every ancestor block, and the transfer SVD uses the projection of `L_t`. This is exact up to rounding: the bases and truncation ranks agree with the v0.1.3 builder except for rounding-level decisions at the threshold, and `compress_hmatrix_to_h2(...; _reference=true)` keeps that builder for validation.
+
+Further changes reduce work without changing the operator: a truncation that keeps every coefficient direction stores the identity (leaf `V = I` or an identity embedding of the children's coefficients) instead of an orthogonal SVD factor spanning the same space; tall transfer matrices are QR-condensed before their SVD; explicit rotations are applied with `ormqr` instead of forming `Q`; and a rigorous triangular-inverse certificate skips transfer SVDs at saturated parents.
+
+The conversion runs as Julia tasks (`threads`, default with several Julia threads and one BLAS thread): a parent's transfer runs in the task that finishes its last child, independent subtrees run concurrently, and each coupling is formed as soon as both of its bases are final, while the top-level basis work continues. Every node's arithmetic is independent of the schedule, so results are bitwise independent of the thread count. With `consume=true`, which `assemble_h2matrix_adaptive` always uses for its private H-matrix, each H-matrix block is released right after its coupling exists.
+
+At the validated settings (`eta=3`, `rtol=1e-10`, four Julia threads, one BLAS thread, separate processes on a shared 14-core M4 Pro), the conversion took:
+
+| Grain (boundary nodes) | v0.1.3 conversion, s | 0.2.0 conversion, s | Sampled peak live heap of the build, GB (v0.1.3 → 0.2.0) |
+|---|---:|---:|---|
+| PLAG066 (6,028) | 12.5 | 1.39 | 1.3-1.4 → 0.62 |
+| PLAG036 (12,415) | 50.7 | 8.97 | 3.3-3.6 → 1.85 |
+| PLAG022 (17,875) | 137.8 | 24.2 | 7.0 → 3.95 |
+| PLAG012 (30,321) | 257.8 | 31.8 | 14.1-15.1 → 6.0 |
+
+Both produced the same stored packet operator (302.8, 714.8, 1511 and 3555 MB) with the same product errors against exact dense products. The heap figures cover the whole build, including the ACA stage, for which the 0.2.0 runs also used Merrill's faster boundary kernel and threaded H-matrix assembly; only the conversion times isolate this package.
 
 ## Make the gradient differentiate the stored energy
 
@@ -141,7 +170,7 @@ Many small coupling products have call, indexing and memory-access overhead. `H2
 
 Packing does not truncate matrix entries; it changes evaluation and accumulation order. In v0.1.3 the selected operator contained 263 coupling packets and 448 near-field packets, applied by BLAS GEMV after gathering inputs into scratch. A one-worker packet plan improved the forward/adjoint medians from 7.79/6.92 ms for the reusable baseline to 6.27/5.50 ms.
 
-The unreleased packet layout keeps couplings as row packets, but stores the near field as *column packets*: every dense block is split at the elementary column intervals defined by all near-field column ranges, and all pieces of one interval are stacked vertically,
+The 0.2.0 packet layout keeps couplings as row packets, but stores the near field as *column packets*: every dense block is split at the elementary column intervals defined by all near-field column ranges, and all pieces of one interval are stacked vertically,
 
 ```math
 Q_e=\begin{bmatrix}D_{\tau_1 e}\\ D_{\tau_2 e}\\ \vdots\end{bmatrix}.
@@ -183,7 +212,7 @@ The machine was shared during these runs, so absolute times varied by about 10%.
 
 The selected tight-tolerance plan uses `coupling_rtol=nothing`. Reusable scratch, implicit identities and packet packing do not add a truncation tolerance.
 
-`H2LowRankMatvecPlan`, optional compact-plan coupling SVD, relaxed basis tolerances and recompression can reduce storage further, but change the approximation. An earlier 244.40 MB candidate used basis tolerance `1e-7` and had screened torque discrepancy about `3.46e-7 T`. It passed that experiment's `1e-6 T` gate, but does not meet the later `1e-9 T` gate. The 303 MB result retains basis tolerance `1e-10`.
+`H2LowRankMatvecPlan`, optional compact-plan coupling SVD, relaxed basis tolerances and recompression can reduce storage further, but change the approximation. An earlier 244.40 MB candidate used basis tolerance `1e-7` and had screened torque discrepancy about `3.46e-7 T`. It passed that experiment's `1e-6 T` gate, but does not meet the later `1e-9 T` gate. The 303 MB result retains basis tolerance `1e-10`; it meets the `1e-9 T` gate on PLAG066 but not on larger grains ([Accuracy at scale](#Accuracy-at-scale:-absolute-rather-than-block-relative-error)).
 
 Packet plans keep factorized couplings as factors: left factors join the packet matrix and right factors are applied per segment, so the packet stores the compact plan's numbers (`keep_factors=false` restores re-materialization).
 
@@ -266,8 +295,16 @@ With seven digits, the `eta=3` mixed variants move the errors by at most 4.6e-5 
 
 So the variants trade memory against speed differently. Float32 packet rows under the bound make single products 10-18% faster than the validated plan with four workers (memory bound) and multi-vector products up to 16% slower per vector (compute bound); the 48-bit format saves another 10-14% of the bytes but decodes slowly. The Float16 coupling tier stores the fewest bytes but is the slowest variant with one or four workers. The mixed plan's construction is the slowest (the PLAG036 Gram eigen-decompositions take 2.7-4.5 s), but it remains below the conversion's cost.
 
+## Accuracy at scale: absolute rather than block-relative error
+
+All product errors on this page are relative errors of whole products. Merrill's end-to-end check measures something else: the tangent torque at every boundary node, in tesla, and the energy, in kT, against the dense operator, with gates of `1e-9 T` and `1e-6 kT`. The settings validated on PLAG066 (`eta=3`, block-relative `rtol=1e-10`, `aca_rtol=1e-11`) pass there (6.95e-10 T at 20 °C) but miss the torque gate by 3.6-14 times on PLAG036, PLAG022 and PLAG012 (3.6e-9 to 1.4e-8 T) and the energy gate as well (1.2e-6 to 4.3e-5 kT), although their relative product errors stay between 5.9e-11 and 1.3e-10. v0.1.3 gives the same numbers. Every smaller variant in the table above also misses the torque gate on these grains at 20 °C.
+
+Two effects combine. First, the torque is node-wise and absolute: the full error matrix of the PLAG036 operator has uniform relative row errors (median 7.7e-11, maximum 3.4e-10), but nodes with small nodal weight (1/24 to 1/6 of the median, many of them corners of a single cell) turn that uniform error into the largest torques. Second, block-relative truncation lets the absolute error grow with the grain, because each cluster's reference singular value grows with the number of blocks in its inherited block row. Neither effect shows in a relative product error.
+
+Global control (`error_control=:global`) addresses the second effect directly: ACA stops at `aca_rtol*s` and every basis keeps the singular values above `rtol*s`, with one operator scale `s` (the RMS row norm). It does not save storage at equal product error on this operator (see [Global (absolute) error control](accuracy_performance.md#Global-(absolute)-error-control)), but at similar storage (within 3%) it gave lower maximum torques than tighter block-relative tolerances (PLAG012, Float64 packets: block `3e-12` 4068 MB and 4.0e-10 T; global `3e-12` 4187 MB and 1.3e-10 T), and its torque error grew 2.2 times from PLAG036 to PLAG012 against 3.0 times for block-relative control. With `rtol=3e-12`, `aca_rtol=3e-13`, `eta=1.5`, pass-through and the mixed-precision plan at `precision_rtol=1e-13`, the largest torque differences over 54 states were 2.1e-11 to 1.6e-10 T on the four grains and the stored operators were 9-19% smaller than the previously validated ones; the mixed-precision rounding (about 4e-14 relative) pays for the tighter tolerance. The builds take 2.9-3.7 times longer on the larger grains. [Accuracy and performance](accuracy_performance.md#Recommended-settings-for-tight-absolute-accuracy) gives the settings and the full table.
+
 ## Implementation and background
 
-The numerical changes were released in [v0.1.1](https://github.com/duserzym/H2Matrices.jl/releases/tag/v0.1.1); [v0.1.2](https://github.com/duserzym/H2Matrices.jl/releases/tag/v0.1.2) changes the Julia requirement. Source files describe [nested conversion and recompression](https://github.com/duserzym/H2Matrices.jl/blob/v0.1.2/src/compression.jl), [reusable products](https://github.com/duserzym/H2Matrices.jl/blob/v0.1.2/src/matvec_plan.jl), [compact bases](https://github.com/duserzym/H2Matrices.jl/blob/v0.1.2/src/compact_plan.jl), and [packet execution](https://github.com/duserzym/H2Matrices.jl/blob/v0.1.2/src/packet_plan.jl).
+The v0.1.x numerical changes were released in [v0.1.1](https://github.com/duserzym/H2Matrices.jl/releases/tag/v0.1.1); [v0.1.2](https://github.com/duserzym/H2Matrices.jl/releases/tag/v0.1.2) changes the Julia requirement. The 0.2.0 changes are described in the [changelog](https://github.com/duserzym/H2Matrices.jl/blob/v0.2.0/CHANGELOG.md). Source files describe [nested conversion and recompression](https://github.com/duserzym/H2Matrices.jl/blob/v0.2.0/src/compression.jl), [condensed, threaded and consuming conversion](https://github.com/duserzym/H2Matrices.jl/blob/v0.2.0/src/condensed_conversion.jl), [reusable products](https://github.com/duserzym/H2Matrices.jl/blob/v0.2.0/src/matvec_plan.jl), [compact and pass-through bases](https://github.com/duserzym/H2Matrices.jl/blob/v0.2.0/src/compact_plan.jl), [packet execution](https://github.com/duserzym/H2Matrices.jl/blob/v0.2.0/src/packet_plan.jl), [several right-hand sides](https://github.com/duserzym/H2Matrices.jl/blob/v0.2.0/src/packet_multi.jl) and [mixed-precision packets](https://github.com/duserzym/H2Matrices.jl/blob/v0.2.0/src/mixed_plan.jl).
 
 For the broader micromagnetic motivation, see Hertel, Christophersen and Börm, [*Large-scale magnetostatic field calculation in finite element micromagnetics with H2-matrices*](https://arxiv.org/abs/1811.05731). [H2Lib's compression source](https://github.com/H2Lib/H2Lib/blob/master/Library/h2compression.c) is an implementation reference for nested-basis recompression. The accuracy and performance claims on these pages come from this package's tests and PLAG066 measurements, not from assuming the published results transfer to this implementation.

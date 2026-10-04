@@ -10,7 +10,7 @@ So far this package is completely vibed out with AI agents, by feeding the HMatr
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.3")
+Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.2.0")
 ```
 
 ## Overview
@@ -23,14 +23,48 @@ matrix–vector product cost.  It builds on
 [HMatrices.jl](https://github.com/WaveProp/HMatrices.jl) for cluster trees,
 kernel matrices, and ACA.
 
-The recent accuracy-preserving improvements are documented in detail on the
+The accuracy and performance work is documented in detail on the
 website: [algorithmic causes and changes](https://duserzym.github.io/H2Matrices.jl/stable/advances/),
 [practical configuration](https://duserzym.github.io/H2Matrices.jl/stable/accuracy_performance/),
 and [real-grain validation with downloadable data](https://duserzym.github.io/H2Matrices.jl/stable/validation/).
 The explanation covers inherited interactions, ACA factor weighting, stored
-adjoints, rank caps, implicit saturated bases, packet products and safe concurrency.
-The selected PLAG066 plan retains the original compression tolerances; the
-separate 244 MB relaxed-tolerance experiment is documented as an accuracy tradeoff.
+adjoints, rank caps, implicit saturated bases, packet products, pass-through
+bases, mixed-precision storage, absolute error control and safe concurrency.
+
+### What changed in 0.2.0
+
+- **Construction**: the H → H² conversion condenses ancestor interactions
+  exactly, runs as Julia tasks and releases the intermediate H-matrix while it
+  converts. On four real boundary-element grains (6,028-30,321 boundary nodes)
+  the conversion was 5.7-9 times faster than v0.1.3 and the build's peak live
+  heap roughly halved, for the same operator up to rounding.
+- **Products**: a new packet engine runs every phase in parallel with explicit
+  write ownership (bitwise independent of the worker count) and applies up to
+  16 right-hand sides per pass; four-worker products were 1.6-1.9 times faster
+  than v0.1.3's packet plan.
+- **Storage**: exact pass-through bases (`passthrough=true`, 4-8% smaller),
+  optional coupling truncation with Float32/Float16 tiers, and
+  `H2MixedPacketMatvecPlan`, which stores low-weight rows in Float32 under a
+  rigorous a priori bound (`precision_rtol`).
+- **Error control**: opt-in absolute tolerances
+  (`error_control=:global`, `atol`, `aca_atol`, `estimate_operator_scale`).
+- **Breaking**: the conversion stores a different but equivalent
+  representation (identity bases where nothing is truncated), conversion
+  threads are on by default with several Julia threads and one BLAS thread,
+  and `H2PacketMatvecPlan` is now parametric. See [CHANGELOG.md](CHANGELOG.md).
+
+An application finding motivates new recommended settings: in Merrill's
+end-to-end micromagnetic check, the tolerances validated on the PLAG066 grain
+with v0.1.x (`rtol=1e-10`, block-relative) gave relative product errors near
+1e-10 but missed a 1e-9 T tangent-torque gate on larger grains (up to 1.4e-8 T
+on PLAG012). Absolute error control at `rtol=3e-12` with the mixed-precision
+plan met the gate on all four grains (at most 1.6e-10 T) while storing 9-19%
+less than the previously validated operator; builds on the three larger grains
+were 2.9-3.7 times slower than with the previous settings. These are maxima
+over sampled physical states, not bounds: states constructed to maximize the
+error break the energy gate on PLAG012. See
+[Large operators with tight absolute accuracy](#large-operators-with-tight-absolute-accuracy)
+below.
 
 For the purpose of illustration, let us consider an abstract matrix `K` with
 entry `i,j` given by the evaluation of some _kernel function_ `G` on points
@@ -163,6 +197,35 @@ or solver error. Validate against a trusted reference at the accuracy required
 by the application. Adaptive assembly still builds an H-matrix first, so peak
 construction memory is larger than final H2 storage.
 
+## Large operators with tight absolute accuracy
+
+```julia
+using H2Matrices, LinearAlgebra
+import HMatrices
+BLAS.set_num_threads(1)            # Julia threads drive conversion and products
+
+h2 = assemble_h2matrix_adaptive(K; nmax=32,
+    error_control=:global,         # ACA and basis tolerances aca_rtol*s and rtol*s,
+    rtol=3e-12, aca_rtol=3e-13,    # s = estimate_operator_scale(...) (RMS row norm)
+    maxrank=typemax(Int), strict=true,
+    adm=HMatrices.StrongAdmissibilityStd(1.5),
+    threads=true)                  # threaded H-matrix leaves; K must allow concurrent getblock!
+plan = H2MixedPacketMatvecPlan(h2; workers=4, precision_rtol=1e-13,
+                               passthrough=true, consume=true)  # h2 is unusable afterwards
+mul!(y, plan, x)
+mul!(g, adjoint(plan), z)          # exact transpose of the stored operator
+mul!(Y, plan, X)                   # several right-hand sides
+```
+
+Merrill's default boundary operator uses these settings in its release built
+on H2Matrices 0.2. They were selected against the dense operator on four
+grains; they are not universal defaults, and the package's own defaults
+remain block-relative (`error_control=:block`). On the larger grains the
+mixed plan's multi-vector products were up to 25% slower per vector than
+Float64 packets; `H2PacketMatvecPlan(h2; workers=4, passthrough=true,
+consume=true)` stores Float64 packets (17-30% more bytes on these grains) when
+batched products matter more than memory.
+
 ## Reusable matvec plans and recompression
 
 ```julia
@@ -194,7 +257,7 @@ application-level validation; reduced storage does not guarantee faster
 products. Its adjoint uses exactly the same stored factors. It also requires
 one plan per worker and immutable shared numerical data.
 
-## Compact and packet plans (v0.1.1)
+## Compact, packet and mixed-precision plans
 
 ```julia
 using LinearAlgebra
@@ -225,20 +288,31 @@ Always use one plan per concurrent caller: `copy(plan)` shares numerical data
 while copying all mutable scratch. Do not mutate shared numerical matrices
 or plan metadata while workers are active. Plans are matvec-only operators.
 
-On the real PLAG066 campaign grain (19,901 nodes, 100,602 tetrahedra, 6,028
-boundary nodes), the four-worker packet plan retained the original basis
+`passthrough=true` folds weakly compressing transfer levels into couplings
+(exact up to rounding). `H2MixedPacketMatvecPlan(h2; precision_rtol=1e-13)`
+runs on the same packet engine and stores low-weight rotated coupling rows in
+Float32 under the a priori bound `‖Ã - A‖_F ≤ precision_rtol · η`;
+`precision_summary(plan)` reports the selection. `coupling_rtol`,
+`coupling_scale` and `coupling_precision` are further approximations that
+need their own validation.
+
+The v0.1.x validation: on the real PLAG066 campaign grain (19,901 nodes,
+100,602 tetrahedra, 6,028 boundary nodes), the four-worker packet plan retained the original basis
 and ACA tolerances (`1e-10` and `1e-11`) while using 302.75 MB of numeric
 storage versus 337.78 MB for H2 and 378.59 MB for H. NEB polishing took
 52.2 s versus 53.9 s for H in paired single runs. Newly generated LEM/NEB
 states differed from H by at most 5.5e-11 T in tangent torque. These results
 are specific to this grain and path, not a general performance guarantee.
 Construction still uses a temporary H matrix; final storage is not peak RSS.
+The same tolerances missed the 1e-9 T torque gate on larger grains (see
+above); the 0.2.0 four-grain results are on the
+[validation page](https://duserzym.github.io/H2Matrices.jl/stable/validation/).
 
 For the unregistered package, install a reproducible release with:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.1.3")
+Pkg.add(url="https://github.com/duserzym/H2Matrices.jl", rev="v0.2.0")
 ```
 
 ## Documentation

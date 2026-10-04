@@ -1,10 +1,10 @@
 # Accuracy and performance
 
-Use separate controls for ACA accuracy, nested-basis truncation and optional coupling truncation. For repeated products, choose a reusable representation and validate both its forward product and the adjoint used by the application. [How the advances work](advances.md) explains the algebra and implementation; [PLAG066 validation](validation.md) gives the measured results and their scope.
+Use separate controls for ACA accuracy, nested-basis truncation and optional coupling truncation. For repeated products, choose a reusable representation and validate both its forward product and the adjoint used by the application. [How the advances work](advances.md) explains the algebra and implementation; [Validation](validation.md) gives the four-grain 0.2.0 results, the PLAG066 v0.1.x evidence and their scope.
 
 ## Assemble with explicit error controls
 
-Julia 1.13 or later is required for v0.1.2. `K` below is an existing `HMatrices.KernelMatrix`:
+Julia 1.13 or later is required. `K` below is an existing `HMatrices.KernelMatrix`:
 
 ```julia
 using H2Matrices, LinearAlgebra
@@ -37,7 +37,7 @@ columns, for `adjoint` rows and for `UnitRange × UnitRange` dense blocks.
 `assemble_hmatrix(...; global_index=true)` reaches the kernel only through
 those calls, and a specialized kernel can share work between entries.
 
-These are the validated PLAG066 parameters, not universal defaults. Tightening `rtol` cannot repair an insufficient rank cap, incomplete basis construction, or an energy-gradient inconsistency. Near-field blocks remain dense.
+These are the parameters validated on PLAG066 with v0.1.x, not universal defaults; on larger grains of the same application they missed an end-to-end torque gate (see [Recommended settings for tight absolute accuracy](#Recommended-settings-for-tight-absolute-accuracy)). Tightening `rtol` cannot repair an insufficient rank cap, incomplete basis construction, or an energy-gradient inconsistency. Near-field blocks remain dense.
 
 ## Choose the product representation
 
@@ -211,6 +211,14 @@ number of blocks in its (inherited) block row. With
 2.4e-11 on PLAG066, PLAG036 and PLAG022 (271.9, 703.3 and 1345 MB), so one
 setting holds an accuracy target across grain sizes; at that tighter accuracy
 block-relative control needed the same storage (PLAG036: 703.7 MB at 1.8e-11).
+
+So at equal *product* error, global control hardly changes storage on this
+operator. It matters for applications whose errors are absolute and node-wise:
+in Merrill's end-to-end torque check it gave lower torque errors per stored
+byte than tighter block-relative tolerances, and its torque error grew less
+from grain to grain; see
+[Recommended settings for tight absolute accuracy](#Recommended-settings-for-tight-absolute-accuracy).
+
 ## Mixed-precision packet storage
 
 ```julia
@@ -251,7 +259,47 @@ All of the following use one BLAS thread, `nmax=32`, `aca_rtol=1e-11`, `strict=t
 | Reduced precision with a rigorous bound | `eta=1.5`, `rtol=1e-10`; `H2MixedPacketMatvecPlan(h2; workers=4, precision_rtol=1e-13, format48=true, passthrough=true, consume=true)` | 211.4 / 517.2 |
 | Fastest single products | as above without `format48` | 245.9 / 578.5 |
 
-In Merrill's end-to-end check on PLAG066 at 20 °C (six magnetization states against the dense operator), the largest tangent-torque differences were 6.95e-10 T for the validated settings and 4.1e-10, 2.5e-10 and 4.2e-10 T for the smallest Float64, smallest overall and rigorous-bound settings, and the largest energy differences 8.3e-8, 4.5e-8, 1.4e-7 and 4.5e-8 kT. These are single-grain checks, not a substitute for the validation steps below.
+In Merrill's end-to-end check on PLAG066 at 20 °C (six magnetization states against the dense operator), the largest tangent-torque differences were 6.95e-10 T for the validated settings and 4.1e-10, 2.5e-10 and 4.2e-10 T for the smallest Float64, smallest overall and rigorous-bound settings, and the largest energy differences 8.3e-8, 4.5e-8, 1.4e-7 and 4.5e-8 kT. On the larger grains PLAG036, PLAG022 and PLAG012 at 20 °C, **every row of this table missed the 1e-9 T torque gate** (1.7e-9 to 1.6e-8 T), although their relative product errors stayed near 1e-10 or below. These rows are storage/speed trade-offs at the product-error level of the v0.1.x validation, not settings for a tight absolute accuracy target.
+
+## Recommended settings for tight absolute accuracy
+
+The micromagnetic campaign behind these measurements needs the boundary operator to reproduce the dense operator's tangent torque to 1e-9 T and its energy to 1e-6 kT, on grains up to 30,321 boundary nodes. These settings met both gates on all four tested grains for every sampled physical state (see the limits below):
+
+```julia
+using H2Matrices, LinearAlgebra
+import HMatrices
+BLAS.set_num_threads(1)
+h2 = assemble_h2matrix_adaptive(K; nmax=32,
+    error_control=:global, rtol=3e-12, aca_rtol=3e-13,  # absolute: rtol*s, aca_rtol*s
+    maxrank=typemax(Int), strict=true,
+    adm=HMatrices.StrongAdmissibilityStd(1.5))
+plan = H2MixedPacketMatvecPlan(h2; workers=4, precision_rtol=1e-13,
+                               passthrough=true, consume=true)
+```
+
+`s` is the RMS row norm from `estimate_operator_scale` (about 0.6 on these operators). Merrill's default `h2_defaults=:accurate`, in its release built on H2Matrices 0.2, uses these settings (with its own packet-worker count) and keeps the previous ones as `h2_defaults=:validated_v013`.
+
+Measured against the dense operator in Merrill's energy and gradient (maximum over states of the largest nodal tangent-torque difference and of the energy difference; previous settings: `eta=3`, block-relative `rtol=1e-10`, `aca_rtol=1e-11`, Float64 packets; recommended settings: 54 states per grain, the six standard states plus 48 random smooth ones):
+
+| Grain (boundary nodes) | Previous settings, 6 states, 20 °C | Recommended, 54 states, 20 °C | Recommended, 54 states, 570 °C | Stored MB (previous → recommended) | Build s (previous → recommended) |
+|---|---|---|---|---|---|
+| PLAG066 (6,028) | 6.95e-10 T, 8.3e-8 kT | 2.1e-11 T, 9.8e-9 kT | 4.2e-12 T | 302.8 → 246.8 | 4.0 → 4.4 |
+| PLAG036 (12,415) | **8.3e-9 T, 2.3e-6 kT** | 8.8e-11 T, 6.5e-8 kT | 1.8e-11 T | 714.8 → 650.1 | 15.3 → 47.7 |
+| PLAG022 (17,875) | **3.6e-9 T, 1.2e-6 kT** | 1.5e-10 T, 7.4e-8 kT | 3.0e-11 T | 1511.5 → 1262.6 | 43.3 → 124.7 |
+| PLAG012 (30,321) | **1.4e-8 T, 4.3e-5 kT** | 1.6e-10 T, 1.4e-7 kT | 3.3e-11 T | 3555.1 → 3226.1 | 58.9 → 219.5 |
+
+The previous settings give the same numbers with v0.1.3, so this is not a regression; over the 54 states their PLAG036 maximum was 1.02e-8 T and 5.85e-6 kT. With the recommended settings the relative product error fell from 7.7e-11 to 8.7e-13 on PLAG036 and from 5.9e-11 to 1.1e-12 on PLAG022 (four-vector maxima, Float64 packets). Energy-and-gradient evaluations took the same time (14.7, 27.1, 56.4 and 207 ms against 14.8, 26.6, 57.6 and 222 ms). The builds are the cost: 2.9-3.7 times longer on the three larger grains (still shorter than v0.1.3's 92, 231 and 425 s at the previous settings with its serial ACA), and the process's maximum RSS after the build was 6.0, 8.4 and 10.2 GB against 4.3, 6.3 and 7.4 GB, including the 2.4-7.7 GB of mesh data and factorizations held before the build; the sampled live-heap upper bound during the PLAG012 build was 15.8 GB against 6.4 GB (v0.1.3 at the previous settings: 15.1 GB). On the 24 GB test machine, PLAG012 builds completed in fresh processes, but not while the 7.35 GB dense reference matrix was also alive. Build time splits about evenly between ACA and the conversion.
+
+Why the earlier settings failed, and why these work:
+
+- **Product error is not the gate.** The torque at a boundary node is a node-wise, absolute quantity. On PLAG036 the full error matrix `E = H² − dense` of the previous operator had uniform relative row errors (median 7.7e-11, maximum 3.4e-10); the rows of the worst-torque nodes ranked between 440th and 3,928th of 12,415. The worst nodes are boundary nodes with small nodal weight (1/24 to 1/6 of the median; many are corners of a single cell), whose torque amplifies a uniform error, and the forward product accounts for nearly all of it. No cheap row-targeted remedy exists; the operator needs uniform absolute accuracy.
+- **Block-relative error grows with the grain.** Each cluster basis is truncated relative to its own largest singular value, which grows with the number of blocks in its (inherited) block row, so at fixed `rtol` the absolute error grows with the grain size. Global control gives every admissible block the same absolute budget. On PLAG012 (Float64 packets), block-relative `rtol=3e-12` stored 4068 MB with 4.0e-10 T on the six states, global `5e-12` 4134 MB with 2.3e-10 T and global `3e-12` 4187 MB with 1.3e-10 T. From PLAG036 to PLAG012 the torque error grew 2.2 times with global and 3.0 times with block-relative control.
+- **The ACA tolerance does not set storage or torque; the basis tolerance does.** `aca_rtol = rtol/10` keeps the H-matrix from limiting the basis.
+- **Mixed precision pays for the tighter tolerance.** At these tolerances Float64 packets would store more than the previous operator on PLAG036 (771 MB) and PLAG012 (4187 MB). The mixed plan's rounding (about 4e-14 relative) is far below the compression error and did not change the torque or energy differences; it stored 15-23% less than Float64 packets, with single products about as fast or faster, but multi-vector products (nine vectors) up to 25% slower per vector on the three larger grains and up to 47% for the adjoint on PLAG066. `format48=true` stored another 10-14% less, with 2-4% slower energy evaluations and 10-30% slower multi-vector products.
+
+**Limits.** These maxima are over sampled, physically motivated states, not a bound over all unit-vector fields. An independent check with 150 new states (smooth multi-wavelength fields, flower, vortex and antivortex, near-saturated, domain-wall and dense-relaxed states, at 20 °C and 570 °C) stayed within 1.6e-10 T and 1.1e-7 kT, and a 100-iteration L-BFGS minimization on PLAG036 reached the same minimum as the dense operator (energies within 4e-8 kT, largest angle between the states 1.2e-6°). States constructed to maximize the error do break the gate on PLAG012: smooth degree-4 polynomial fields with singular points reached 1.44e-6 kT, and rough, non-physical states 1.7e-8 T and 2.6e-5 kT. The largest errors sit at the application's gauge reference node (a single-cell corner on the boundary), whose error row is 40-80 times larger than other corner nodes'; no remedy has been tested.
+
+These are measurements of one kernel and application on one machine (14-core M4 Pro, 24 GB), not a certified bound. The full end-to-end protocol is summarised on the [validation page](validation.md#0.2.0:-four-grains-and-the-torque-gate).
 
 ## Validate before enlarging a campaign
 
