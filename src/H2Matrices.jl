@@ -23,13 +23,18 @@ include("diagnostics.jl")
 storage_bytes(p::H2LowRankMatvecPlan) = _lowrank_plan_storage_bytes(p)
 include("assembly.jl")
 include("compression.jl")
+include("condensed_conversion.jl")
 include("copying.jl")
 include("compact_plan.jl")
 include("packet_plan.jl")
+include("packet_multi.jl")
+include("mixed_plan.jl")
 include("solvers.jl")
 include("plotting.jl")
 
 export H2PacketMatvecPlan,
+    H2MixedPacketMatvecPlan,
+    precision_summary,
     H2CompactMatvecPlan,
     H2LowRankMatvecPlan,
     H2MatvecPlan,
@@ -39,9 +44,12 @@ export H2PacketMatvecPlan,
     assemble_h2matrix,
     assemble_h2matrix_adaptive,
     compress_hmatrix_to_h2,
+    estimate_operator_scale,
     compression_ratio,
     compression_summary,
     storage_bytes,
+    multi_workspace_bytes,
+    release_multi_workspace!,
     dense_storage_bytes,
     block_stats,
     rank_stats,

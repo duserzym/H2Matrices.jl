@@ -1,5 +1,109 @@
 # Changelog
 
+## Unreleased
+
+- Faster, lower-memory H → H² conversion with the same operator up to rounding:
+  each cluster condenses its active set (direct partner-weighted factors plus
+  inherited ancestor factors) by an exact Gram-preserving QR, so widths stay at
+  most the cluster size instead of accumulating every ancestor block. Truncation
+  ranks are unchanged except for rounding-level decisions at the truncation
+  threshold (e.g. exactly rank-deficient blocks with `rtol=0`). The v0.1.3
+  builder remains available as `compress_hmatrix_to_h2(...; _reference=true)`
+  for validation.
+- Untruncated bases are stored as identity leaves or identity embeddings (an
+  exact change of coordinates); a rigorous triangular-inverse certificate skips
+  transfer SVDs at saturated parents; compact plans skip exact identity
+  expansions (bitwise identical couplings).
+- `compress_hmatrix_to_h2(...; threads)` builds row/column bases, independent
+  subtrees and couplings with Julia tasks (default when Julia has several
+  threads and BLAS uses one). Results are bitwise independent of the thread count.
+- Couplings are formed as soon as both of their cluster bases are final, while
+  the remaining (top-level) basis work continues, using otherwise idle threads.
+- `consume=true` releases each H-matrix block as soon as its coupling exists
+  (during the basis construction; the H-matrix is unusable afterwards, also if
+  the conversion throws) and `H2PacketMatvecPlan(h2; consume=true)` releases
+  raw H² blocks while packing. `assemble_h2matrix_adaptive` consumes its private
+  H-matrix; its `threads` keyword threads the H-matrix assembly (`K` must
+  allow concurrent `getblock!`), `conversion_threads` the conversion, and
+  `comp` selects the compressor.
+- Restructure `H2PacketMatvecPlan` for race-free parallel phases. Couplings
+  remain row packets; near-field blocks are split at elementary column
+  intervals into column packets. Fused long-column kernels replace gathered
+  BLAS GEMV in both directions. Transposed couplings and forward near-field
+  write private slots that the owning downward-pass task reduces in fixed
+  order. The upward pass, forward near field and downward pass now run in
+  parallel, per-worker reduction buffers are removed, and products are bitwise
+  independent of the worker count. Stored numeric data is unchanged.
+- One packet engine for several packet layouts: `H2PacketMatvecPlan{C}` is
+  parametric in its coupling-packet type, and the structured packets below and
+  the mixed-precision packets of `H2MixedPacketMatvecPlan` share its phases,
+  write ownership, near-field column packets, slot reductions and kernels
+  (`TransposedPacketH2Plan` now uses `<:H2PacketMatvecPlan`).
+- `H2CompactMatvecPlan(h2; passthrough=true)`: internal basis nodes whose
+  transfer matrices barely compress and serve few couplings use their
+  children's concatenated coefficients; their transfers are folded into
+  couplings and parent transfers (exact up to rounding; less storage and
+  faster products). Packet plans copy those coefficients in the upward and
+  downward passes.
+- Compact-plan coupling truncation (`coupling_rtol`) gains `coupling_scale`:
+  `:block` (default, each coupling's own norm), `:global` (the largest stored
+  block norm, near field included) or a positive number `s` (threshold
+  `coupling_rtol*s`), and `coupling_precision=Float32` or `Float16` (small
+  retained components stored in reduced precision with exact power-of-two
+  column scales where needed, Float64 arithmetic, so the adjoint stays the
+  exact transpose of the stored operator). Both qualify `coupling_rtol` and
+  are rejected without it. These are approximations.
+- Packet plans keep factorized couplings as factors (`keep_factors=true`;
+  `false` multiplies them out), store reduced-precision couplings in
+  per-precision packet parts, and drop couplings without any retained
+  component. `H2PacketMatvecPlan(h2; consume=true, compact options...)` and
+  `H2CompactMatvecPlan(h2; consume=true)` release the source blocks while the
+  plan is built (each transformed coupling once factorized); the plans are
+  identical to non-consuming builds.
+- Add `H2MixedPacketMatvecPlan(compact_or_h2; workers, precision_rtol=1e-13,
+  format48=false)` and `precision_summary`: coupling packets rotated to their
+  left singular basis store low-weight rows in Float32 (optionally a 48-bit
+  format) under an a priori Frobenius bound `precision_rtol * η` on the
+  reduced-precision rounding; products accumulate in Float64 and the adjoint
+  is the exact transpose of the stored operator. It runs on the packet engine
+  (near field in Float64 column packets), so products are bitwise independent
+  of the worker count and support several right-hand sides; construction is
+  bitwise deterministic under threads; packets whose norm could overflow a
+  reduced format stay in Float64. It composes with pass-through bases: the
+  rotations of pass-through nodes and of their children, which share
+  coefficients with their parent, are stored as reflectors instead of being
+  absorbed into the basis. From an H² matrix it forwards compact options
+  (`passthrough`, `coupling_rtol`, `coupling_scale`) to a consuming compact
+  plan with `consume=true`; factorized couplings are multiplied out, and
+  `coupling_precision` (a different reduced-precision storage) is rejected
+  before anything is consumed.
+- Global (absolute) error control, opt-in: `compress_hmatrix_to_h2(...; atol,
+  safeguard_rtol)` keeps basis singular values above
+  `max(rtol*σ₁, min(atol, safeguard_rtol*σ₁))`;
+  `assemble_h2matrix_adaptive(...; error_control=:global, scale)` uses the
+  absolute ACA tolerance `aca_rtol*s` and basis threshold `rtol*s` with the
+  new `estimate_operator_scale` (RMS row norm from sampled kernel rows), and
+  also accepts explicit `atol`/`aca_atol`. Defaults are unchanged. On the
+  campaign's boundary operator global control saved only about 1% over
+  block-relative control at equal accuracy.
+- Add `mul!(Y, plan, X)` and transpose/adjoint products with matrices for
+  packet plans, streaming the operator once per block of up to 16 right-hand
+  sides, `multi_workspace_bytes` and `release_multi_workspace!` (frees or
+  shrinks the multi-RHS scratch kept by the plan).
+- Measured on the campaign's PLAG066/PLAG036 boundary operators (6,028/12,415
+  nodes; dense 290.7/1233 MB): the validated `eta=3` operator is 302.8/714.8
+  MB; exact pass-through 288.1/661.0 MB; with `eta=1.5` and Float64 global
+  coupling truncation 258.5/628.5 MB; with Float16 coupling tiers
+  179.1/474.9 MB; mixed-precision packets on pass-through `eta=1.5` bases
+  211.4/517.2 MB (`format48=true`) under the 1e-13 bound. All of these meet
+  the validated product-error levels against exact dense products as measured
+  by the four-reference-vector maximum and the Frobenius error (not a
+  worst-case bound: on PLAG066 the `eta=1.5` variants have a spectral-norm
+  error about 4% above the validated operator's). Only pass-through is an
+  exact representation change; the others are different approximations that
+  need application validation. See `docs/src/advances.md` for timings and the
+  trade-offs.
+
 ## 0.1.3
 
 Documentation-only release: explain the causes of the accuracy fixes and the

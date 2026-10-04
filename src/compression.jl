@@ -20,7 +20,8 @@ Reference: Börm, "Efficient Numerical Methods for Non-local Operators",
 # ════════════════════════════════════════════════════════════════════
 
 """
-    compress_hmatrix_to_h2(hmat; rtol=1e-8, maxrank=50)
+    compress_hmatrix_to_h2(hmat; rtol=1e-8, atol=0, maxrank=50, strict=false,
+                           threads=..., consume=false, safeguard_rtol=Inf)
 
 Convert an assembled `HMatrix` (from HMatrices.jl) into an `H2Matrix`
 with shared nested cluster bases.
@@ -37,10 +38,36 @@ The algorithm:
 # Arguments
 - `hmat` : an assembled HMatrix from HMatrices.jl
 - `rtol` : relative truncation tolerance for basis rank
+- `atol` : absolute (global) truncation threshold, default 0. Each cluster
+  basis keeps the singular values of its partner-weighted active set above
+  `max(rtol*σ₁, atol)`, where σ₁ is that cluster's largest singular value.
+  The weighted active set carries the scale of its blocks, so `atol` is in
+  the units of the matrix entries' block norms (for example `τ * scale` with
+  [`estimate_operator_scale`](@ref)); use `rtol=0` for purely absolute control.
+- `safeguard_rtol` : with `atol > 0`, never discard singular values above
+  `safeguard_rtol*σ₁` (a relative floor that protects clusters if `atol` is
+  too large); `Inf` (default) disables it
 - `maxrank` : maximum allowed rank per cluster
 - `global_index` : whether matvec inputs and outputs use global DOF ordering
 - `strict` : throw if the rank cap prevents any requested local SVD tolerance;
   otherwise warn. Local tolerances are not a global operator error certificate.
+- `threads` : build row/column bases, independent subtrees and couplings with
+  Julia tasks. Results are bitwise independent of the thread count. Defaults
+  to true when Julia has several threads and BLAS uses one thread.
+- `consume` : release each H-matrix block as soon as its coupling is formed,
+  during the basis construction (the near-field blocks move into the H² matrix
+  without copying). `hmat` must not be used afterwards, also when the
+  conversion throws (e.g. a strict rank-cap failure); use `consume=false` to
+  retry with another `maxrank` on the same H-matrix.
+
+Ancestor interactions are condensed exactly: only Gram matrices of the active
+sets determine the bases, so each cluster passes a factor of width at most its
+size to its children instead of every ancestor block. A truncation that keeps
+every coefficient direction stores the identity (leaf `V = I` or an identity
+embedding), an exact change of coordinates that compact plans exploit. The
+operator equals the v0.1.3 construction (`_reference=true`) up to rounding;
+truncation ranks agree except for rounding-level decisions at the threshold
+(e.g. exactly rank-deficient active sets with `rtol=0`).
 
 # Returns
 An `H2Matrix` approximating the same kernel.
@@ -50,9 +77,24 @@ function compress_hmatrix_to_h2(hmat::HMatrix;
                                 maxrank::Int=50,
                                 global_index::Bool=true,
                                 strict::Bool=false,
+                                threads::Bool=_conversion_threads_default(),
+                                consume::Bool=false,
+                                atol::Real=0.0,
+                                safeguard_rtol::Real=Inf,
+                                _reference::Bool=false,
                                 _print::Bool=true)
     isfinite(rtol) && rtol >= 0 || throw(ArgumentError("rtol must be finite and nonnegative"))
     maxrank > 0 || throw(ArgumentError("maxrank must be positive"))
+    isfinite(atol) && atol >= 0 || throw(ArgumentError("atol must be finite and nonnegative"))
+    safeguard_rtol > 0 || throw(ArgumentError("safeguard_rtol must be positive (Inf disables it)"))
+    _reference && atol > 0 && throw(ArgumentError("atol is not supported by the v0.1.3 reference builder (_reference=true)"))
+    if !_reference
+        h2 = _compress_hmatrix_to_h2_condensed(hmat; rtol, maxrank, strict, threads, consume,
+                                               atol=Float64(atol), safeguard=Float64(safeguard_rtol))
+        h2.global_index = global_index
+        _print && _print_compression_summary(h2)
+        return h2
+    end
     rt = HMatrices.rowtree(hmat)
     ct = HMatrices.coltree(hmat)
 
@@ -70,11 +112,11 @@ function compress_hmatrix_to_h2(hmat::HMatrix;
     # Build row basis from A matrices (bottom-up with propagation)
     empty_inherited = Tuple{Matrix{Float64},UnitRange{Int}}[]
     capped_residuals = Float64[]
-    _build_adaptive_basis_recursive!(rb, row_data, empty_inherited;
+    _build_adaptive_basis_reference!(rb, row_data, empty_inherited;
                                       rtol, maxrank, is_row=true, capped_residuals)
 
     # Build col basis from B matrices (bottom-up with propagation)
-    _build_adaptive_basis_recursive!(cb, col_data, Tuple{Matrix{Float64},UnitRange{Int}}[];
+    _build_adaptive_basis_reference!(cb, col_data, Tuple{Matrix{Float64},UnitRange{Int}}[];
                                       rtol, maxrank, is_row=false, capped_residuals)
 
     if !isempty(capped_residuals)
@@ -153,6 +195,10 @@ function _collect_rk_recursive!(row_data, col_data, hmat::HMatrix)
 end
 
 """
+Reference (v0.1.3) adaptive basis construction, kept for validation of the
+condensed builder `_build_adaptive_basis_recursive!`. It passes every ancestor
+block down unchanged, so active widths grow with depth.
+
 Build adaptive basis bottom-up from collected RkMatrix data, with
 top-down propagation of ancestor-level block data to leaf clusters.
 
@@ -162,7 +208,7 @@ The `data` argument maps `objectid(cluster)` → Vector of (A=..., B=...).
 Ancestor-level blocks are propagated down: their subrows are distributed
 to child clusters so leaf bases capture all necessary column spaces.
 """
-function _build_adaptive_basis_recursive!(
+function _build_adaptive_basis_reference!(
     cb::ClusterBasis{N,T},
     data::Dict,
     inherited::Vector{Tuple{Matrix{Float64},UnitRange{Int}}};
@@ -222,7 +268,7 @@ function _build_adaptive_basis_recursive!(
 
         # 5. Recurse on children (bottom-up)
         for child in cb.children
-            _build_adaptive_basis_recursive!(child, data, new_inherited;
+            _build_adaptive_basis_reference!(child, data, new_inherited;
                                               rtol, maxrank, is_row, capped_residuals)
         end
 
@@ -268,6 +314,35 @@ function _build_adaptive_basis_recursive!(
         end
     end
     return cb
+end
+
+"""
+    _build_adaptive_basis_recursive!(cb, data, inherited; rtol, maxrank, is_row, capped_residuals)
+
+Build nested adaptive bases with exact active-set condensation (see
+`condensed_conversion.jl`). `inherited` lists ancestor matrices with their row
+ranges; their rows restricted to `cb` seed the inherited active set.
+"""
+function _build_adaptive_basis_recursive!(
+    cb::ClusterBasis,
+    data::Dict,
+    inherited::Vector{Tuple{Matrix{Float64},UnitRange{Int}}};
+    rtol::Float64=1e-8,
+    maxrank::Int=50,
+    is_row::Bool=true,
+    capped_residuals::Vector{Float64}=Float64[],
+    kinds=nothing,
+    threads::Bool=false
+)
+    kinds = kinds === nothing ? _ConversionBases(cb) : kinds
+    r = index_range(cb.cluster)
+    seed = isempty(inherited) ? nothing :
+        Matrix(transpose(reduce(hcat, [M[(first(r)-first(ar)+1):(last(r)-first(ar)+1), :] for (M, ar) in inherited])))
+    ctx = _BasisBuildContext(_node_entries(data, cb, kinds), rtol, 0.0, Inf, maxrank, is_row, capped_residuals,
+                             ReentrantLock(), kinds, _condensed_spawn_min(threads), nothing,
+                             _BasisSchedule(cb, length(kinds.kind)))
+    _condensed_basis!(cb, seed, ctx)
+    return _materialize_identity_embeddings!(cb, kinds)
 end
 
 function _record_rank_cap!(residuals, singular_values, k, rtol, maxrank)
@@ -842,7 +917,9 @@ end
 
 """
     assemble_h2matrix_adaptive(K, rowtree, coltree;
-        rtol=1e-8, maxrank=50, aca_rtol=nothing, aca_kwargs...)
+        rtol=1e-8, maxrank=50, aca_rtol=nothing, threads=false,
+        conversion_threads=..., comp=nothing, error_control=:block,
+        scale=nothing, atol=0, aca_atol=0, safeguard_rtol=Inf, aca_kwargs...)
 
 Assemble an H²-matrix adaptively: first build an H-matrix using ACA,
 then convert to H² format with nested bases.
@@ -855,9 +932,37 @@ because the ranks adapt to the actual kernel smoothness.
 - `rowtree`, `coltree` : cluster trees
 - `rtol` : relative tolerance for H² basis truncation
 - `maxrank` : maximum rank per cluster
-- `aca_rtol` : tolerance for ACA (defaults to `rtol / 10`)
+- `aca_rtol` : tolerance for ACA (defaults to `rtol / 10`); ignored when
+  `comp` is given
 - `strict` : reject a basis rank cap that prevents the local tolerance
+- `threads` : assemble the H-matrix leaves on `Threads.nthreads()` tasks
+  (HMatrices' threaded assembly). Every leaf is computed independently with
+  its own compressor buffer, so the H-matrix (and therefore the H² result) is
+  identical to the serial build; `K` must support concurrent `getblock!`
+  calls. Defaults to `false` for backward compatibility.
+- `conversion_threads` : run the H → H² conversion with Julia tasks
+  (deterministic and bitwise independent of the thread count; defaults to
+  true when Julia has several threads and BLAS uses one). This is the
+  `threads` keyword of [`compress_hmatrix_to_h2`](@ref).
+- `comp` : compressor for the admissible blocks, called as in
+  `HMatrices.assemble_hmatrix` (default
+  `HMatrices.PartialACA(; atol=aca_atol, rtol=aca_rtol)`)
+- `error_control` : `:block` (default) measures every truncation relative to
+  the block or cluster it acts on. `:global` measures them against one
+  operator scale `s` (`scale`, or [`estimate_operator_scale`](@ref) when
+  `nothing`): ACA stops at the absolute tolerance `aca_rtol*s` (no relative
+  criterion) and the bases keep singular values above `rtol*s` (`atol`; no
+  relative criterion except `safeguard_rtol`). Blocks whose norms are far
+  below the operator's are then not resolved to the same relative accuracy as
+  the strongest ones. This changes the approximation; validate accuracy.
+- `atol`, `safeguard_rtol` : absolute basis threshold and relative floor of
+  [`compress_hmatrix_to_h2`](@ref) (with `:global`, `atol` is at least `rtol*s`)
+- `aca_atol` : absolute ACA tolerance (Frobenius norm of the last ACA update,
+  as in `HMatrices.PartialACA`; with `:global`, at least `aca_rtol*s`)
 - `aca_kwargs...` : additional arguments for `assemble_hmatrix`
+
+The intermediate H-matrix is private, so its blocks are released during the
+conversion (`consume=true`), lowering peak construction memory.
 """
 function assemble_h2matrix_adaptive(
     K,
@@ -869,22 +974,82 @@ function assemble_h2matrix_adaptive(
     adm=StrongAdmissibilityStd(3),
     global_index::Bool=true,
     strict::Bool=false,
+    threads::Bool=false,
+    conversion_threads::Bool=_conversion_threads_default(),
+    comp=nothing,
+    error_control::Symbol=:block,
+    scale::Union{Nothing,Real}=nothing,
+    atol::Real=0.0,
+    aca_atol::Real=0.0,
+    safeguard_rtol::Real=Inf,
     kwargs...
 ) where {N,T}
+    error_control in (:block, :global) ||
+        throw(ArgumentError("error_control must be :block or :global"))
+    isfinite(aca_atol) && aca_atol >= 0 || throw(ArgumentError("aca_atol must be finite and nonnegative"))
+    aca_rel = aca_rtol === nothing ? rtol / 10 : aca_rtol
+    basis_rtol = rtol
+    if error_control === :global
+        s = scale === nothing ? estimate_operator_scale(K, rowtree, coltree; global_index) : Float64(scale)
+        isfinite(s) && s > 0 || throw(ArgumentError("the operator scale must be positive and finite (got $s)"))
+        aca_atol = max(aca_atol, aca_rel * s)
+        atol = max(atol, rtol * s)
+        aca_rel = 0.0
+        basis_rtol = 0.0
+    elseif scale !== nothing
+        throw(ArgumentError("scale is only used with error_control=:global"))
+    end
     # Step 1: Build H-matrix via ACA
-    ar = aca_rtol === nothing ? rtol / 10 : aca_rtol
+    compressor = comp === nothing ? HMatrices.PartialACA(; atol=aca_atol, rtol=aca_rel) : comp
     hmat = HMatrices.assemble_hmatrix(K, rowtree, coltree;
                                        adm=adm,
-                                       comp=HMatrices.PartialACA(; rtol=ar),
+                                       comp=compressor,
                                        global_index=global_index,
-                                       threads=false,
+                                       threads=threads,
                                        kwargs...)
 
     # Step 2: Convert to H²
-    h2 = compress_hmatrix_to_h2(hmat; rtol, maxrank, global_index, strict, _print=false)
+    h2 = compress_hmatrix_to_h2(hmat; rtol=basis_rtol, atol, safeguard_rtol, maxrank, global_index, strict,
+                                threads=conversion_threads, consume=true,
+                                _print=false)
 
     _print_compression_summary(h2)
     return h2
+end
+
+"""
+    estimate_operator_scale(K, rowtree, coltree; global_index=true, samples=32) -> Float64
+
+Root-mean-square row norm `‖K‖_F / √m` of the `m × n` matrix `K`, estimated
+from `samples` rows spread evenly over the row tree's ordering (exact when
+`samples ≥ m`). Rows are read with the same `getblock!` calls that ACA uses, so
+this costs `samples` kernel rows. Deterministic.
+
+It is the operator scale of `assemble_h2matrix_adaptive(...; error_control=:global)`.
+For example, `s = estimate_operator_scale(K, rt, ct)` can be passed as `scale=s`
+there and as `coupling_scale=s` to [`H2CompactMatvecPlan`](@ref), so that all
+truncations use one absolute scale. If every admissible block of `N` blocks
+has a Frobenius error at most `τ*s`, the total error is at most
+`τ*sqrt(N/m)*‖K‖_F`.
+"""
+function estimate_operator_scale(K, rowtree::ClusterTree, coltree::ClusterTree;
+                                 global_index::Bool=true, samples::Integer=32)
+    samples > 0 || throw(ArgumentError("samples must be positive"))
+    rows = index_range(rowtree)
+    cols = index_range(coltree)
+    m = length(rows)
+    (m == 0 || isempty(cols)) && return 0.0
+    Kp = global_index ? HMatrices.PermutedMatrix(K, loc2glob(rowtree), loc2glob(coltree)) : K
+    s = min(Int(samples), m)
+    row = Vector{Float64}(undef, length(cols))
+    acc = 0.0
+    for k in 1:s
+        # Midpoints of `s` equal strata of the tree ordering.
+        i = first(rows) - 1 + cld((2k - 1) * m, 2s)
+        getblock!(row, adjoint(Kp), cols, i)
+        acc += sum(abs2, row)
+    end
+    return sqrt(acc / s)
 end
 
 """

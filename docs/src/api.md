@@ -11,6 +11,7 @@ assemble_h2matrix_adaptive
 
 ```@docs
 compress_hmatrix_to_h2
+estimate_operator_scale
 recompress!
 compress_matrix_to_h2
 ```
@@ -33,7 +34,11 @@ sampled_frobenius_error
 H2MatvecPlan
 H2CompactMatvecPlan
 H2PacketMatvecPlan
+H2MixedPacketMatvecPlan
+precision_summary
 H2LowRankMatvecPlan
+multi_workspace_bytes
+release_multi_workspace!
 h2matvec!
 forward_transform!
 backward_transform!
