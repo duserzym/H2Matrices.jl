@@ -1,3 +1,5 @@
+<img src="docs/src/assets/logo.svg" alt="H2Matrices.jl logo" width="96" align="right">
+
 # H2Matrices.jl
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21748179.svg)](https://doi.org/10.5281/zenodo.21748179)
