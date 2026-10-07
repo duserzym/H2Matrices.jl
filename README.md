@@ -1,4 +1,4 @@
-<img src="docs/src/assets/logo.svg" alt="H2Matrices.jl logo" width="96" align="right">
+<p><img src="docs/src/assets/logo.svg" alt="H2Matrices.jl logo" width="96"></p>
 
 # H2Matrices.jl
 
